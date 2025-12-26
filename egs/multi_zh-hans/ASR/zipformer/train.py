@@ -58,7 +58,6 @@ from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
-import kaldialign
 import optim
 import sentencepiece as spm
 import torch
@@ -431,7 +430,7 @@ def get_parser():
     parser.add_argument(
         "--compute-valid-wer",
         type=str2bool,
-        default=True,
+        default=False,
         help="Whether to compute WER during validation.",
     )
 
@@ -557,7 +556,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
-            "compute_valid_wer": True,
+            "compute_valid_wer": False,
             "env_info": get_env_info(),
         }
     )
@@ -934,15 +933,21 @@ def compute_validation_loss(
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
 
-    def _compute_wer_stats(refs: List[str], hyps: List[str]) -> Tuple[int, int, int, int, int]:
+    def _compute_wer_stats(
+        refs: List[str], hyps: List[str]
+    ) -> Tuple[int, int, int, int, int]:
+        import kaldialign
+
         ERR = "*"
-        errs = 0
         ref_len = 0
         ins = 0
         dels = 0
         subs = 0
         for ref, hyp in zip(refs, hyps):
-            ali = kaldialign.align(ref, hyp, ERR)
+            # CER: align at character level; drop spaces defensively.
+            ref_seq = list(ref.replace(" ", ""))
+            hyp_seq = list(hyp.replace(" ", ""))
+            ali = kaldialign.align(ref_seq, hyp_seq, ERR)
             for ref_sym, hyp_sym in ali:
                 if ref_sym == ERR:
                     ins += 1
@@ -950,7 +955,7 @@ def compute_validation_loss(
                     dels += 1
                 elif ref_sym != hyp_sym:
                     subs += 1
-            ref_len += len(ref)
+            ref_len += len(ref_seq)
         errs = ins + dels + subs
         return errs, ref_len, ins, dels, subs
 
@@ -980,7 +985,7 @@ def compute_validation_loss(
             pruned_loss = torch.empty(0)
             ctc_loss = torch.empty(0)
 
-            loss = 0.0
+            loss = torch.zeros((), device=device)
 
             if params.use_transducer:
                 simple_loss, pruned_loss = asr_model.forward_transducer(

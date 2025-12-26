@@ -62,7 +62,6 @@ from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
-import kaldialign
 import optim
 import sentencepiece as spm
 import torch
@@ -507,7 +506,7 @@ def get_parser():
     parser.add_argument(
         "--compute-valid-wer",
         type=str2bool,
-        default=True,
+        default=False,
         help="Whether to compute WER during validation.",
     )
 
@@ -639,7 +638,7 @@ def get_params() -> AttributeDict:
             "ignore_id": -1,
             "label_smoothing": 0.1,
             "warm_step": 2000,
-            "compute_valid_wer": True,
+            "compute_valid_wer": False,
             "env_info": get_env_info(),
         }
     )
@@ -1050,6 +1049,8 @@ def compute_validation_loss(
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
     ) -> Tuple[int, int, int, int, int]:
+        import kaldialign
+
         ERR = "*"
         ref_len = 0
         ins = 0
@@ -1094,7 +1095,7 @@ def compute_validation_loss(
             cr_loss = torch.empty(0)
             attention_decoder_loss = torch.empty(0)
 
-            loss = 0.0
+            loss = torch.zeros((), device=device)
 
             if params.use_transducer:
                 simple_loss, pruned_loss = asr_model.forward_transducer(

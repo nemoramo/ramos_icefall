@@ -239,17 +239,24 @@ class LibriSpeechAsrDataModule:
             )
             return cuts
 
-        # Guard against repeated .resample() calls in case dataloaders are
-        # recreated (can stack transforms depending on CutSet implementation).
-        if not hasattr(self, "_resample_applied"):
-            self._resample_applied = set()
+        # Cache resampled CutSet to avoid stacking transforms when dataloaders are
+        # recreated.
+        #
+        # IMPORTANT: if the same original cuts comes in again, we must return the
+        # cached *resampled* CutSet (not the original).
+        if not hasattr(self, "_resample_cache"):
+            self._resample_cache = {}
+        cache = self._resample_cache
+
         key = (id(cuts), resample_to)
-        if key in self._resample_applied:
-            return cuts
-        self._resample_applied.add(key)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
 
         resampled = cuts.resample(resample_to)
-        self._resample_applied.add((id(resampled), resample_to))
+        cache[key] = resampled
+        # Also cache by resampled id so passing resampled cuts back in is a no-op.
+        cache[(id(resampled), resample_to)] = resampled
         return resampled
 
     def train_dataloaders(
