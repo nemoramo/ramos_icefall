@@ -154,6 +154,13 @@ class LibriSpeechAsrDataModule:
             "if available.",
         )
         group.add_argument(
+            "--resample-to",
+            type=int,
+            default=0,
+            help="If > 0 and using --on-the-fly-feats, resample audio to this sampling rate. "
+            "If --on-the-fly-feats is disabled, this option is ignored with a warning.",
+        )
+        group.add_argument(
             "--shuffle",
             type=str2bool,
             default=True,
@@ -215,6 +222,43 @@ class LibriSpeechAsrDataModule:
             help="AudioSamples or PrecomputedFeatures",
         )
 
+    def _maybe_resample_cuts(self, cuts: CutSet) -> CutSet:
+        """Optionally resample audio for on-the-fly feature extraction.
+
+        NOTE: This is intentionally gated behind --on-the-fly-feats to avoid
+        silently changing behavior for precomputed features.
+        """
+        resample_to = int(getattr(self.args, "resample_to", 0) or 0)
+        if resample_to <= 0:
+            return cuts
+
+        if not getattr(self.args, "on_the_fly_feats", False):
+            logging.warning(
+                "Ignoring --resample-to=%s because --on-the-fly-feats is disabled.",
+                resample_to,
+            )
+            return cuts
+
+        # Cache resampled CutSet to avoid stacking transforms when dataloaders are
+        # recreated.
+        #
+        # IMPORTANT: if the same original cuts comes in again, we must return the
+        # cached *resampled* CutSet (not the original).
+        if not hasattr(self, "_resample_cache"):
+            self._resample_cache = {}
+        cache = self._resample_cache
+
+        key = (id(cuts), resample_to)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        resampled = cuts.resample(resample_to)
+        cache[key] = resampled
+        # Also cache by resampled id so passing resampled cuts back in is a no-op.
+        cache[(id(resampled), resample_to)] = resampled
+        return resampled
+
     def train_dataloaders(
         self,
         cuts_train: CutSet,
@@ -227,6 +271,8 @@ class LibriSpeechAsrDataModule:
           sampler_state_dict:
             The state dict for the training sampler.
         """
+        cuts_train = self._maybe_resample_cuts(cuts_train)
+
         transforms = []
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
@@ -344,6 +390,8 @@ class LibriSpeechAsrDataModule:
         return train_dl
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
+        cuts_valid = self._maybe_resample_cuts(cuts_valid)
+
         transforms = []
         if self.args.concatenate_cuts:
             transforms = [

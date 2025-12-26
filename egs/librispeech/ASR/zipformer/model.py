@@ -345,7 +345,8 @@ class AsrModel(nn.Module):
         spec_augment: Optional[SpecAugment] = None,
         supervision_segments: Optional[torch.Tensor] = None,
         time_warp_factor: Optional[int] = 80,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_encoder_out: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """
         Args:
           x:
@@ -380,6 +381,9 @@ class AsrModel(nn.Module):
             Parameter for the time warping; larger values mean more warping.
             Set to ``None``, or less than ``1``, to disable.
             Used only if use_cr_ctc is True.
+          return_encoder_out:
+            If True, also return (encoder_out, encoder_out_lens) to support
+            downstream decoding without re-running the encoder.
 
         Returns:
           Return the transducer losses, CTC loss, AED loss,
@@ -400,28 +404,41 @@ class AsrModel(nn.Module):
 
         device = x.device
 
+        # For consistency-regularized CTC, we need two "views" of each utterance.
+        # In training we may create the second view via spec-augment/time-warping;
+        # otherwise (e.g. validation) the two views would be identical in eval
+        # mode, so we can avoid doubling encoder compute by duplicating at the
+        # encoder output level only for the CR-CTC branch.
+        do_input_dup = use_cr_ctc and (use_spec_aug or self.training)
+
+        y_for_seq = y
         if use_cr_ctc:
             assert self.use_ctc
-            if use_spec_aug:
-                assert spec_augment is not None and spec_augment.time_warp_factor < 1
-                # Apply time warping before input duplicating
-                assert supervision_segments is not None
-                x = time_warp(
-                    x,
-                    time_warp_factor=time_warp_factor,
-                    supervision_segments=supervision_segments,
-                )
-                # Independently apply frequency masking and time masking to the two copies
-                x = spec_augment(x.repeat(2, 1, 1))
-            else:
-                x = x.repeat(2, 1, 1)
-            x_lens = x_lens.repeat(2)
-            y = k2.ragged.cat([y, y], axis=0)
+            if do_input_dup:
+                # Always duplicate inputs in training to allow dropout/noise to
+                # create the second view even when spec-augment is disabled.
+                if use_spec_aug:
+                    assert (
+                        spec_augment is not None and spec_augment.time_warp_factor < 1
+                    )
+                    # Apply time warping before input duplicating
+                    assert supervision_segments is not None
+                    x = time_warp(
+                        x,
+                        time_warp_factor=time_warp_factor,
+                        supervision_segments=supervision_segments,
+                    )
+                    # Independently apply frequency masking and time masking to the two copies
+                    x = spec_augment(x.repeat(2, 1, 1))
+                else:
+                    x = x.repeat(2, 1, 1)
+                x_lens = x_lens.repeat(2)
+                y_for_seq = k2.ragged.cat([y, y], axis=0)
 
         # Compute encoder outputs
         encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens)
 
-        row_splits = y.shape.row_splits(1)
+        row_splits = y_for_seq.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
         if self.use_transducer:
@@ -429,13 +446,13 @@ class AsrModel(nn.Module):
             simple_loss, pruned_loss = self.forward_transducer(
                 encoder_out=encoder_out,
                 encoder_out_lens=encoder_out_lens,
-                y=y.to(device),
+                y=y_for_seq.to(device),
                 y_lens=y_lens,
                 prune_range=prune_range,
                 am_scale=am_scale,
                 lm_scale=lm_scale,
             )
-            if use_cr_ctc:
+            if use_cr_ctc and do_input_dup:
                 simple_loss = simple_loss * 0.5
                 pruned_loss = pruned_loss * 0.5
         else:
@@ -444,7 +461,7 @@ class AsrModel(nn.Module):
 
         if self.use_ctc:
             # Compute CTC loss
-            targets = y.values
+            targets = y_for_seq.values
             if not use_cr_ctc:
                 ctc_loss = self.forward_ctc(
                     encoder_out=encoder_out,
@@ -454,12 +471,27 @@ class AsrModel(nn.Module):
                 )
                 cr_loss = torch.empty(0)
             else:
-                ctc_loss, cr_loss = self.forward_cr_ctc(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    targets=targets,
-                    target_lengths=y_lens,
-                )
+                if do_input_dup:
+                    ctc_loss, cr_loss = self.forward_cr_ctc(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                        targets=targets,
+                        target_lengths=y_lens,
+                    )
+                else:
+                    encoder_out_for_ctc = encoder_out.repeat(2, 1, 1)
+                    encoder_out_lens_for_ctc = encoder_out_lens.repeat(2)
+                    y_for_ctc = k2.ragged.cat([y, y], axis=0)
+                    targets = y_for_ctc.values
+                    row_splits = y_for_ctc.shape.row_splits(1)
+                    y_lens_for_ctc = row_splits[1:] - row_splits[:-1]
+
+                    ctc_loss, cr_loss = self.forward_cr_ctc(
+                        encoder_out=encoder_out_for_ctc,
+                        encoder_out_lens=encoder_out_lens_for_ctc,
+                        targets=targets,
+                        target_lengths=y_lens_for_ctc,
+                    )
                 ctc_loss = ctc_loss * 0.5
                 cr_loss = cr_loss * 0.5
         else:
@@ -470,12 +502,22 @@ class AsrModel(nn.Module):
             attention_decoder_loss = self.attention_decoder.calc_att_loss(
                 encoder_out=encoder_out,
                 encoder_out_lens=encoder_out_lens,
-                ys=y.to(device),
+                ys=y_for_seq.to(device),
                 ys_lens=y_lens.to(device),
             )
-            if use_cr_ctc:
+            if use_cr_ctc and do_input_dup:
                 attention_decoder_loss = attention_decoder_loss * 0.5
         else:
             attention_decoder_loss = torch.empty(0)
 
+        if return_encoder_out:
+            return (
+                simple_loss,
+                pruned_loss,
+                ctc_loss,
+                attention_decoder_loss,
+                cr_loss,
+                encoder_out,
+                encoder_out_lens,
+            )
         return simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss

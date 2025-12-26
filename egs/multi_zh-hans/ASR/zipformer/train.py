@@ -55,7 +55,7 @@ import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
 import optim
@@ -64,11 +64,12 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import AsrDataModule
+from beam_search import greedy_search_batch
 from decoder import Decoder
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
-from lhotse.utils import fix_random_seed
+from lhotse.utils import compute_num_frames, fix_random_seed
 from model import AsrModel
 from multi_dataset import MultiDataset
 from optim import Eden, ScaledAdam
@@ -87,6 +88,7 @@ from icefall.checkpoint import (
     save_checkpoint_with_global_batch_idx,
     update_averaged_model,
 )
+from icefall.decode import ctc_greedy_search
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
@@ -293,6 +295,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--valid-interval",
+        type=int,
+        default=3000,
+        help="Run validation every N training batches (per epoch). "
+        "Note: validation also runs at batch 0.",
+    )
+
+    parser.add_argument(
         "--start-epoch",
         type=int,
         default=1,
@@ -418,6 +428,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--compute-valid-wer",
+        type=str2bool,
+        default=False,
+        help="Whether to compute WER during validation.",
+    )
+
+    parser.add_argument(
+        "--skip-oom-check",
+        type=str2bool,
+        default=False,
+        help="Skip the initial pessimistic-batch OOM scan (useful for quick smoke tests).",
+    )
+
+    parser.add_argument(
         "--inf-check",
         type=str2bool,
         default=False,
@@ -532,6 +556,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
+            "compute_valid_wer": False,
             "env_info": get_env_info(),
         }
     )
@@ -793,7 +818,10 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
+    return_encoder_out: bool = False,
+) -> Union[
+    Tuple[Tensor, MetricsTracker], Tuple[Tensor, MetricsTracker, Tensor, Tensor]
+]:
     """
     Compute loss given the model and its inputs.
 
@@ -809,10 +837,16 @@ def compute_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
+      return_encoder_out:
+        If True, also return (encoder_out, encoder_out_lens) so validation can
+        decode without re-running the encoder. If the model does not support
+        this kwarg, we will fall back to re-running forward_encoder only when
+        return_encoder_out=True.
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    asr_model = model.module if isinstance(model, DDP) else model
+    device = next(asr_model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -832,15 +866,61 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        losses = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
-        simple_loss, pruned_loss, ctc_loss = losses[:3]
+        # NOTE: Only pass `return_encoder_out` if the underlying model supports it.
+        # This avoids hard failures when swapping in alternative model implementations.
+        if return_encoder_out:
+            import inspect
+
+            supports = getattr(asr_model, "_supports_return_encoder_out", None)
+            if supports is None:
+                try:
+                    supports = (
+                        "return_encoder_out"
+                        in inspect.signature(asr_model.forward).parameters
+                    )
+                except (TypeError, ValueError):
+                    supports = False
+                setattr(asr_model, "_supports_return_encoder_out", supports)
+
+            if supports:
+                out = model(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                    return_encoder_out=True,
+                )
+                encoder_out, encoder_out_lens = out[-2], out[-1]
+            else:
+                out = model(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                )
+                if not hasattr(asr_model, "forward_encoder"):
+                    raise RuntimeError(
+                        "return_encoder_out=True but model does not support "
+                        "return_encoder_out and has no forward_encoder() for fallback."
+                    )
+                encoder_out, encoder_out_lens = asr_model.forward_encoder(
+                    feature, feature_lens
+                )
+        else:
+            out = model(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+            )
+
+        simple_loss, pruned_loss, ctc_loss = out[:3]
 
         loss = 0.0
 
@@ -878,6 +958,8 @@ def compute_loss(
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
 
+    if return_encoder_out:
+        return loss, info, encoder_out, encoder_out_lens
     return loss, info
 
 
@@ -887,32 +969,135 @@ def compute_validation_loss(
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-) -> MetricsTracker:
-    """Run the validation process."""
+) -> Tuple[MetricsTracker, Optional[Dict[str, float]]]:
+    """Run the validation process.
+
+    Returns:
+      Return a pair of (loss_metrics, wer_stats). `wer_stats` is None if
+      `params.compute_valid_wer` is False.
+    """
     model.eval()
+
+    # WER is tracked as totals so it can be reduced across ranks.
+    tot_errs = 0
+    tot_ref_len = 0
+    tot_ins = 0
+    tot_del = 0
+    tot_sub = 0
 
     tot_loss = MetricsTracker()
 
-    for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=False,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
+    asr_model = model.module if isinstance(model, DDP) else model
+    device = next(asr_model.parameters()).device
+
+    def _compute_wer_stats(
+        refs: List[str], hyps: List[str]
+    ) -> Tuple[int, int, int, int, int]:
+        import kaldialign
+
+        ERR = "*"
+        ref_len = 0
+        ins = 0
+        dels = 0
+        subs = 0
+        for ref, hyp in zip(refs, hyps):
+            # CER: align at character level; drop spaces defensively.
+            ref_seq = list(ref.replace(" ", ""))
+            hyp_seq = list(hyp.replace(" ", ""))
+            ali = kaldialign.align(ref_seq, hyp_seq, ERR)
+            for ref_sym, hyp_sym in ali:
+                if ref_sym == ERR:
+                    ins += 1
+                elif hyp_sym == ERR:
+                    dels += 1
+                elif ref_sym != hyp_sym:
+                    subs += 1
+            ref_len += len(ref_seq)
+        errs = ins + dels + subs
+        return errs, ref_len, ins, dels, subs
+
+    with torch.no_grad():
+        for _, batch in enumerate(valid_dl):
+            if params.compute_valid_wer:
+                _, info, encoder_out, encoder_out_lens = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                    return_encoder_out=True,
+                )
+            else:
+                _, info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                )
+
+            tot_loss = tot_loss + info
+
+            if params.compute_valid_wer:
+                texts = batch["supervisions"]["text"]
+                texts = [normalize_text_alimeeting(text) for text in texts]
+                if params.use_transducer:
+                    hyp_tokens = greedy_search_batch(
+                        model=asr_model,
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                    )
+                else:
+                    ctc_output = asr_model.ctc_output(encoder_out)
+                    hyp_tokens = ctc_greedy_search(
+                        ctc_output=ctc_output,
+                        encoder_out_lens=encoder_out_lens,
+                        blank_id=params.blank_id,
+                    )
+
+                hyp_texts = sp.decode(hyp_tokens)
+                hyp_texts = [normalize_text_alimeeting(h) for h in hyp_texts]
+
+                errs, ref_len, ins, dels, subs = _compute_wer_stats(texts, hyp_texts)
+                tot_errs += errs
+                tot_ref_len += ref_len
+                tot_ins += ins
+                tot_del += dels
+                tot_sub += subs
 
     if world_size > 1:
-        tot_loss.reduce(loss.device)
+        tot_loss.reduce(device)
+        if params.compute_valid_wer:
+            s = torch.tensor(
+                [tot_errs, tot_ref_len, tot_ins, tot_del, tot_sub],
+                device=device,
+                dtype=torch.long,
+            )
+            torch.distributed.all_reduce(s, op=torch.distributed.ReduceOp.SUM)
+            tot_errs, tot_ref_len, tot_ins, tot_del, tot_sub = s.cpu().tolist()
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
-    return tot_loss
+    wer_stats = None
+    if params.compute_valid_wer:
+        denom = max(1, tot_ref_len)
+        cer = tot_errs / denom
+        wer_stats = {
+            # NOTE: For this recipe we compute CER (character error rate). We keep
+            # the "wer" key as an alias for backward compatibility.
+            "cer": cer,
+            "wer": cer,
+            "errors": float(tot_errs),
+            "ref_len": float(tot_ref_len),
+            "ins": float(tot_ins),
+            "del": float(tot_del),
+            "sub": float(tot_sub),
+        }
+
+    return tot_loss, wer_stats
 
 
 def train_one_epoch(
@@ -1092,7 +1277,7 @@ def train_one_epoch(
 
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
+            valid_info, wer_stats = compute_validation_loss(
                 params=params,
                 model=model,
                 sp=sp,
@@ -1101,6 +1286,13 @@ def train_one_epoch(
             )
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
+            if wer_stats is not None:
+                logging.info(
+                    f"[valid] %CER {wer_stats['cer']:.2%} "
+                    f"[{int(wer_stats['errors'])} / {int(wer_stats['ref_len'])}, "
+                    f"{int(wer_stats['ins'])} ins, {int(wer_stats['del'])} del, "
+                    f"{int(wer_stats['sub'])} sub ]"
+                )
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
             )
@@ -1108,6 +1300,10 @@ def train_one_epoch(
                 valid_info.write_summary(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
+                if wer_stats is not None:
+                    tb_writer.add_scalar(
+                        "train/valid_cer", wer_stats["cer"], params.batch_idx_train
+                    )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
@@ -1237,13 +1433,23 @@ def run(rank, world_size, args):
 
         # In ./zipformer.py, the conv module uses the following expression
         # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
+        num_frames = c.num_frames
+        if num_frames is None:
+            # When using on-the-fly feature extraction, cuts might not have
+            # precomputed feature metadata. Estimate the frame count using
+            # fbank defaults (10ms frame shift).
+            sampling_rate = c.sampling_rate if c.sampling_rate is not None else 16000
+            num_frames = compute_num_frames(
+                duration=c.duration, frame_shift=0.01, sampling_rate=sampling_rate
+            )
+
+        T = ((num_frames - 7) // 2 + 1) // 2
         tokens = sp.encode(c.supervisions[0].text, out_type=str)
 
         if T < len(tokens):
             logging.warning(
                 f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
+                f"Number of frames (before subsampling): {num_frames}. "
                 f"Number of frames (after subsampling): {T}. "
                 f"Text: {c.supervisions[0].text}. "
                 f"Tokens: {tokens}. "
@@ -1269,7 +1475,7 @@ def run(rank, world_size, args):
     valid_cuts = multi_dataset.dev_cuts()
     valid_dl = data_module.valid_dataloaders(valid_cuts)
 
-    if not params.print_diagnostics:
+    if not params.print_diagnostics and not params.skip_oom_check:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,

@@ -385,10 +385,20 @@ def get_tokenizer(vocab_file_path: str):
                 - if use "char", derived from unfiltered character & symbol counts of custom dataset
                 - if use "byte", set to 256 (unicode byte range)
     """
+    def _decode_vocab_symbol(symbol: str) -> str:
+        # Allow writing unsafe/hidden Unicode characters as placeholders
+        # like "U+202E" in vocab files and decode them at load time.
+        if symbol.startswith("U+") and len(symbol) in (6, 8):
+            try:
+                return chr(int(symbol[2:], 16))
+            except ValueError:
+                return symbol
+        return symbol
+
     with open(vocab_file_path, "r", encoding="utf-8") as f:
         vocab_char_map = {}
         for i, char in enumerate(f):
-            vocab_char_map[char[:-1]] = i
+            vocab_char_map[_decode_vocab_symbol(char.rstrip("\n"))] = i
     vocab_size = len(vocab_char_map)
 
     return vocab_char_map, vocab_size
