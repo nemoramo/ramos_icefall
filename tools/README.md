@@ -10,6 +10,12 @@
 - `causal=true`（流式模型）：**必须走真流式** `encoder_embed.streaming_forward()` + `Zipformer2.streaming_forward()`（带状态、按 chunk 推理）
   - chunk 参数 `chunk_size / left_context_frames` 默认从 `.pt` 中读取并选择（可用 YAML/CLI 覆盖，但必须在 `.pt` 列表内）
 
+对齐头（alignment head）可选：
+
+- `--align-kind ctc`（默认）：使用 CTC 头强制对齐；可输出 token duration，因此 `--with-end` 有效
+- `--align-kind rnnt`：使用 Transducer/RNNT 头强制对齐；当前实现只提供 token start time（没有 duration），因此 `--with-end` 只会显示 start
+- `--align-kind auto`：如果模型包含 RNNT 头则优先用 `rnnt`，否则回退到 `ctc`
+
 ### 为什么必须区分 streaming/offline forward？
 
 Zipformer 的 “模拟流式”（attention mask + 随机 chunk）和 “真流式”（`streaming_forward()` + states）**不是同一条计算路径**。  
@@ -17,17 +23,17 @@ Zipformer 的 “模拟流式”（attention mask + 随机 chunk）和 “真流
 
 ### 原理（实现流程）
 
-以 CTC 强制对齐为例（默认 `--align-kind ctc`）：
+以强制对齐为例（`--align-kind ctc|rnnt|auto`）：
 
 1. 读入 wav（`torchaudio.load`），必要时重采样到 16k（`--sample-rate`）。
 2. 提取 80 维 fbank（`torchaudio.compliance.kaldi.fbank`，10ms frame shift）。
 3. 计算 encoder 输出：
    - offline：一次性 `forward_encoder(features)`
    - streaming：按 chunk 输入 fbank，维护 encoder/cache states，累计拼接成完整 `encoder_out`
-4. 调用 `icefall.forced_alignment.force_align(kind='ctc')`：
-   - 通过 `model.ctc_output(encoder_out)` 得到 CTC log-probs
-   - 用 `torchaudio.functional.forced_align` + `merge_tokens` 做 token-level 对齐
-   - 用 subsampling factor + frame shift 把 frame index 换算为秒
+4. 调用 `icefall.forced_alignment.force_align(kind=...)`：
+   - CTC：用 `model.ctc_output(encoder_out)` 得到 log-probs，再用 `torchaudio.functional.forced_align` 做对齐（可得到 duration）
+   - RNNT：用模型的 `decoder/joiner` 做对齐（当前实现输出 token start time，没有 duration）
+   - 最终都用 subsampling factor + frame shift 把 frame index 换算为秒
 5. 把 SentencePiece token 合并成词：
    - 依据 token 的 `▁` 词边界标记进行分组
    - 通过 `SentencePieceProcessor.decode_pieces()` 得到最终的词字符串
