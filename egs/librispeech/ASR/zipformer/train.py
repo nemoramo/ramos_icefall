@@ -906,7 +906,10 @@ def compute_loss(
     batch: dict,
     is_training: bool,
     spec_augment: Optional[SpecAugment] = None,
-) -> Tuple[Tensor, MetricsTracker]:
+    return_encoder_out: bool = False,
+) -> Union[
+    Tuple[Tensor, MetricsTracker], Tuple[Tensor, MetricsTracker, Tensor, Tensor]
+]:
     """
     Compute loss given the model and its inputs.
 
@@ -924,6 +927,9 @@ def compute_loss(
         disables autograd.
       spec_augment:
         The SpecAugment instance used only when use_cr_ctc is True.
+      return_encoder_out:
+        If True, also return (encoder_out, encoder_out_lens) so validation can
+        decode without re-running the encoder.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -957,7 +963,7 @@ def compute_loss(
         supervision_segments = None
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss = model(
+        out = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -969,7 +975,11 @@ def compute_loss(
             spec_augment=spec_augment,
             supervision_segments=supervision_segments,
             time_warp_factor=params.spec_aug_time_warp_factor,
+            return_encoder_out=return_encoder_out,
         )
+        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss = out[:5]
+        if return_encoder_out:
+            encoder_out, encoder_out_lens = out[-2], out[-1]
 
         loss = 0.0
 
@@ -1016,6 +1026,8 @@ def compute_loss(
     if params.use_attention_decoder:
         info["attn_decoder_loss"] = attention_decoder_loss.detach().cpu().item()
 
+    if return_encoder_out:
+        return loss, info, encoder_out, encoder_out_lens
     return loss, info
 
 
@@ -1071,113 +1083,28 @@ def compute_validation_loss(
 
     with torch.no_grad():
         for _, batch in enumerate(valid_dl):
-            feature = batch["inputs"]
-            assert feature.ndim == 3
-            feature = feature.to(device)
-
-            supervisions = batch["supervisions"]
-            feature_lens = supervisions["num_frames"].to(device)
-
-            texts = batch["supervisions"]["text"]
-            y = sp.encode(texts, out_type=int)
-            y = k2.RaggedTensor(y)
-
-            encoder_out, encoder_out_lens = asr_model.forward_encoder(
-                feature, feature_lens
-            )
-
-            row_splits = y.shape.row_splits(1)
-            y_lens = row_splits[1:] - row_splits[:-1]
-
-            simple_loss = torch.empty(0)
-            pruned_loss = torch.empty(0)
-            ctc_loss = torch.empty(0)
-            cr_loss = torch.empty(0)
-            attention_decoder_loss = torch.empty(0)
-
-            loss = torch.zeros((), device=device)
-
-            if params.use_transducer:
-                simple_loss, pruned_loss = asr_model.forward_transducer(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    y=y.to(device),
-                    y_lens=y_lens,
-                    prune_range=params.prune_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
+            if params.compute_valid_wer:
+                _, info, encoder_out, encoder_out_lens = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                    return_encoder_out=True,
                 )
-
-                batch_idx_train = params.batch_idx_train
-                warm_step = params.warm_step
-                s = params.simple_loss_scale
-                simple_loss_scale = (
-                    s
-                    if batch_idx_train >= warm_step
-                    else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
+            else:
+                _, info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
                 )
-                pruned_loss_scale = (
-                    1.0
-                    if batch_idx_train >= warm_step
-                    else 0.1 + 0.9 * (batch_idx_train / warm_step)
-                )
-                loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
-
-            if params.use_ctc:
-                if not params.use_cr_ctc:
-                    ctc_loss = asr_model.forward_ctc(
-                        encoder_out=encoder_out,
-                        encoder_out_lens=encoder_out_lens,
-                        targets=y.values,
-                        target_lengths=y_lens,
-                    )
-                else:
-                    encoder_out_dup = encoder_out.repeat(2, 1, 1)
-                    encoder_out_lens_dup = encoder_out_lens.repeat(2)
-                    y_dup = k2.ragged.cat([y, y], axis=0)
-                    row_splits_dup = y_dup.shape.row_splits(1)
-                    y_lens_dup = row_splits_dup[1:] - row_splits_dup[:-1]
-                    ctc_loss, cr_loss = asr_model.forward_cr_ctc(
-                        encoder_out=encoder_out_dup,
-                        encoder_out_lens=encoder_out_lens_dup,
-                        targets=y_dup.values,
-                        target_lengths=y_lens_dup,
-                    )
-                    ctc_loss = ctc_loss * 0.5
-                    cr_loss = cr_loss * 0.5
-
-                loss += params.ctc_loss_scale * ctc_loss
-                if params.use_cr_ctc:
-                    loss += params.cr_loss_scale * cr_loss
-
-            if params.use_attention_decoder:
-                attention_decoder_loss = asr_model.attention_decoder.calc_att_loss(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    ys=y.to(device),
-                    ys_lens=y_lens.to(device),
-                )
-                loss += params.attention_decoder_loss_scale * attention_decoder_loss
-
-            info = MetricsTracker()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-
-            info["loss"] = loss.detach().cpu().item()
-            if params.use_transducer:
-                info["simple_loss"] = simple_loss.detach().cpu().item()
-                info["pruned_loss"] = pruned_loss.detach().cpu().item()
-            if params.use_ctc:
-                info["ctc_loss"] = ctc_loss.detach().cpu().item()
-                if params.use_cr_ctc:
-                    info["cr_loss"] = cr_loss.detach().cpu().item()
-            if params.use_attention_decoder:
-                info["attn_decoder_loss"] = attention_decoder_loss.detach().cpu().item()
 
             tot_loss = tot_loss + info
 
             if params.compute_valid_wer:
+                texts = batch["supervisions"]["text"]
                 if params.use_transducer:
                     hyp_tokens = greedy_search_batch(
                         model=asr_model,

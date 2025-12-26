@@ -818,7 +818,10 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
+    return_encoder_out: bool = False,
+) -> Union[
+    Tuple[Tensor, MetricsTracker], Tuple[Tensor, MetricsTracker, Tensor, Tensor]
+]:
     """
     Compute loss given the model and its inputs.
 
@@ -834,6 +837,9 @@ def compute_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
+      return_encoder_out:
+        If True, also return (encoder_out, encoder_out_lens) so validation can
+        decode without re-running the encoder.
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
@@ -857,15 +863,18 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        losses = model(
+        out = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            return_encoder_out=return_encoder_out,
         )
-        simple_loss, pruned_loss, ctc_loss = losses[:3]
+        simple_loss, pruned_loss, ctc_loss = out[:3]
+        if return_encoder_out:
+            encoder_out, encoder_out_lens = out[-2], out[-1]
 
         loss = 0.0
 
@@ -903,6 +912,8 @@ def compute_loss(
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
 
+    if return_encoder_out:
+        return loss, info, encoder_out, encoder_out_lens
     return loss, info
 
 
@@ -961,84 +972,29 @@ def compute_validation_loss(
 
     with torch.no_grad():
         for _, batch in enumerate(valid_dl):
-            feature = batch["inputs"]
-            assert feature.ndim == 3
-            feature = feature.to(device)
-
-            supervisions = batch["supervisions"]
-            feature_lens = supervisions["num_frames"].to(device)
-
-            texts = batch["supervisions"]["text"]
-            texts = [normalize_text_alimeeting(text) for text in texts]
-
-            y = sp.encode(texts, out_type=int)
-            y = k2.RaggedTensor(y)
-
-            encoder_out, encoder_out_lens = asr_model.forward_encoder(
-                feature, feature_lens
-            )
-
-            row_splits = y.shape.row_splits(1)
-            y_lens = row_splits[1:] - row_splits[:-1]
-
-            simple_loss = torch.empty(0)
-            pruned_loss = torch.empty(0)
-            ctc_loss = torch.empty(0)
-
-            loss = torch.zeros((), device=device)
-
-            if params.use_transducer:
-                simple_loss, pruned_loss = asr_model.forward_transducer(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    y=y.to(device),
-                    y_lens=y_lens,
-                    prune_range=params.prune_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
+            if params.compute_valid_wer:
+                _, info, encoder_out, encoder_out_lens = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                    return_encoder_out=True,
                 )
-
-                batch_idx_train = params.batch_idx_train
-                warm_step = params.warm_step
-                s = params.simple_loss_scale
-                simple_loss_scale = (
-                    s
-                    if batch_idx_train >= warm_step
-                    else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
+            else:
+                _, info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
                 )
-                pruned_loss_scale = (
-                    1.0
-                    if batch_idx_train >= warm_step
-                    else 0.1 + 0.9 * (batch_idx_train / warm_step)
-                )
-                loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
-
-            if params.use_ctc:
-                ctc_loss = asr_model.forward_ctc(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    targets=y.values,
-                    target_lengths=y_lens,
-                )
-                loss += params.ctc_loss_scale * ctc_loss
-
-            assert loss.requires_grad is False
-
-            info = MetricsTracker()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-
-            info["loss"] = loss.detach().cpu().item()
-            if params.use_transducer:
-                info["simple_loss"] = simple_loss.detach().cpu().item()
-                info["pruned_loss"] = pruned_loss.detach().cpu().item()
-            if params.use_ctc:
-                info["ctc_loss"] = ctc_loss.detach().cpu().item()
 
             tot_loss = tot_loss + info
 
             if params.compute_valid_wer:
+                texts = batch["supervisions"]["text"]
+                texts = [normalize_text_alimeeting(text) for text in texts]
                 if params.use_transducer:
                     hyp_tokens = greedy_search_batch(
                         model=asr_model,
@@ -1082,8 +1038,12 @@ def compute_validation_loss(
     wer_stats = None
     if params.compute_valid_wer:
         denom = max(1, tot_ref_len)
+        cer = tot_errs / denom
         wer_stats = {
-            "wer": tot_errs / denom,
+            # NOTE: For this recipe we compute CER (character error rate). We keep
+            # the "wer" key as an alias for backward compatibility.
+            "cer": cer,
+            "wer": cer,
             "errors": float(tot_errs),
             "ref_len": float(tot_ref_len),
             "ins": float(tot_ins),
@@ -1282,7 +1242,7 @@ def train_one_epoch(
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if wer_stats is not None:
                 logging.info(
-                    f"[valid] %CER {wer_stats['wer']:.2%} "
+                    f"[valid] %CER {wer_stats['cer']:.2%} "
                     f"[{int(wer_stats['errors'])} / {int(wer_stats['ref_len'])}, "
                     f"{int(wer_stats['ins'])} ins, {int(wer_stats['del'])} del, "
                     f"{int(wer_stats['sub'])} sub ]"
@@ -1296,10 +1256,7 @@ def train_one_epoch(
                 )
                 if wer_stats is not None:
                     tb_writer.add_scalar(
-                        "train/valid_wer", wer_stats["wer"], params.batch_idx_train
-                    )
-                    tb_writer.add_scalar(
-                        "train/valid_cer", wer_stats["wer"], params.batch_idx_train
+                        "train/valid_cer", wer_stats["cer"], params.batch_idx_train
                     )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
