@@ -154,6 +154,12 @@ class LibriSpeechAsrDataModule:
             "if available.",
         )
         group.add_argument(
+            "--resample-to",
+            type=int,
+            default=0,
+            help="If > 0 and using --on-the-fly-feats, resample audio to this sampling rate.",
+        )
+        group.add_argument(
             "--shuffle",
             type=str2bool,
             default=True,
@@ -227,6 +233,9 @@ class LibriSpeechAsrDataModule:
           sampler_state_dict:
             The state dict for the training sampler.
         """
+        if self.args.on_the_fly_feats and self.args.resample_to and self.args.resample_to > 0:
+            cuts_train = cuts_train.resample(self.args.resample_to)
+
         transforms = []
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
@@ -344,6 +353,9 @@ class LibriSpeechAsrDataModule:
         return train_dl
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
+        if self.args.on_the_fly_feats and self.args.resample_to and self.args.resample_to > 0:
+            cuts_valid = cuts_valid.resample(self.args.resample_to)
+
         transforms = []
         if self.args.concatenate_cuts:
             transforms = [

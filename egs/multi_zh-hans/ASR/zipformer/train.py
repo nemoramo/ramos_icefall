@@ -55,20 +55,22 @@ import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
+import kaldialign
 import optim
 import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import AsrDataModule
+from beam_search import greedy_search_batch
 from decoder import Decoder
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
-from lhotse.utils import fix_random_seed
+from lhotse.utils import compute_num_frames, fix_random_seed
 from model import AsrModel
 from multi_dataset import MultiDataset
 from optim import Eden, ScaledAdam
@@ -87,6 +89,7 @@ from icefall.checkpoint import (
     save_checkpoint_with_global_batch_idx,
     update_averaged_model,
 )
+from icefall.decode import ctc_greedy_search
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
@@ -293,6 +296,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--valid-interval",
+        type=int,
+        default=3000,
+        help="Run validation every N batches (per epoch).",
+    )
+
+    parser.add_argument(
         "--start-epoch",
         type=int,
         default=1,
@@ -418,6 +428,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--compute-valid-wer",
+        type=str2bool,
+        default=True,
+        help="Whether to compute WER during validation.",
+    )
+
+    parser.add_argument(
+        "--skip-oom-check",
+        type=str2bool,
+        default=False,
+        help="Skip the initial pessimistic-batch OOM scan (useful for quick smoke tests).",
+    )
+
+    parser.add_argument(
         "--inf-check",
         type=str2bool,
         default=False,
@@ -532,6 +556,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
+            "compute_valid_wer": True,
             "env_info": get_env_info(),
         }
     )
@@ -887,32 +912,180 @@ def compute_validation_loss(
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-) -> MetricsTracker:
-    """Run the validation process."""
+) -> Tuple[MetricsTracker, Optional[Dict[str, float]]]:
+    """Run the validation process.
+
+    Returns:
+      Return a pair of (loss_metrics, wer_stats). `wer_stats` is None if
+      `params.compute_valid_wer` is False.
+    """
     model.eval()
+
+    # WER is tracked as totals so it can be reduced across ranks.
+    tot_errs = 0
+    tot_ref_len = 0
+    tot_ins = 0
+    tot_del = 0
+    tot_sub = 0
 
     tot_loss = MetricsTracker()
 
-    for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=False,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
+    asr_model = model.module if isinstance(model, DDP) else model
+    device = next(asr_model.parameters()).device
+
+    def _compute_wer_stats(refs: List[str], hyps: List[str]) -> Tuple[int, int, int, int, int]:
+        ERR = "*"
+        errs = 0
+        ref_len = 0
+        ins = 0
+        dels = 0
+        subs = 0
+        for ref, hyp in zip(refs, hyps):
+            ali = kaldialign.align(ref, hyp, ERR)
+            for ref_sym, hyp_sym in ali:
+                if ref_sym == ERR:
+                    ins += 1
+                elif hyp_sym == ERR:
+                    dels += 1
+                elif ref_sym != hyp_sym:
+                    subs += 1
+            ref_len += len(ref)
+        errs = ins + dels + subs
+        return errs, ref_len, ins, dels, subs
+
+    with torch.no_grad():
+        for _, batch in enumerate(valid_dl):
+            feature = batch["inputs"]
+            assert feature.ndim == 3
+            feature = feature.to(device)
+
+            supervisions = batch["supervisions"]
+            feature_lens = supervisions["num_frames"].to(device)
+
+            texts = batch["supervisions"]["text"]
+            texts = [normalize_text_alimeeting(text) for text in texts]
+
+            y = sp.encode(texts, out_type=int)
+            y = k2.RaggedTensor(y)
+
+            encoder_out, encoder_out_lens = asr_model.forward_encoder(
+                feature, feature_lens
+            )
+
+            row_splits = y.shape.row_splits(1)
+            y_lens = row_splits[1:] - row_splits[:-1]
+
+            simple_loss = torch.empty(0)
+            pruned_loss = torch.empty(0)
+            ctc_loss = torch.empty(0)
+
+            loss = 0.0
+
+            if params.use_transducer:
+                simple_loss, pruned_loss = asr_model.forward_transducer(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    y=y.to(device),
+                    y_lens=y_lens,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                )
+
+                batch_idx_train = params.batch_idx_train
+                warm_step = params.warm_step
+                s = params.simple_loss_scale
+                simple_loss_scale = (
+                    s
+                    if batch_idx_train >= warm_step
+                    else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
+                )
+                pruned_loss_scale = (
+                    1.0
+                    if batch_idx_train >= warm_step
+                    else 0.1 + 0.9 * (batch_idx_train / warm_step)
+                )
+                loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+
+            if params.use_ctc:
+                ctc_loss = asr_model.forward_ctc(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    targets=y.values,
+                    target_lengths=y_lens,
+                )
+                loss += params.ctc_loss_scale * ctc_loss
+
+            assert loss.requires_grad is False
+
+            info = MetricsTracker()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+
+            info["loss"] = loss.detach().cpu().item()
+            if params.use_transducer:
+                info["simple_loss"] = simple_loss.detach().cpu().item()
+                info["pruned_loss"] = pruned_loss.detach().cpu().item()
+            if params.use_ctc:
+                info["ctc_loss"] = ctc_loss.detach().cpu().item()
+
+            tot_loss = tot_loss + info
+
+            if params.compute_valid_wer:
+                if params.use_transducer:
+                    hyp_tokens = greedy_search_batch(
+                        model=asr_model,
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                    )
+                else:
+                    ctc_output = asr_model.ctc_output(encoder_out)
+                    hyp_tokens = ctc_greedy_search(
+                        ctc_output=ctc_output,
+                        encoder_out_lens=encoder_out_lens,
+                        blank_id=params.blank_id,
+                    )
+
+                hyp_texts = sp.decode(hyp_tokens)
+                hyp_texts = [normalize_text_alimeeting(h) for h in hyp_texts]
+
+                errs, ref_len, ins, dels, subs = _compute_wer_stats(texts, hyp_texts)
+                tot_errs += errs
+                tot_ref_len += ref_len
+                tot_ins += ins
+                tot_del += dels
+                tot_sub += subs
 
     if world_size > 1:
-        tot_loss.reduce(loss.device)
+        tot_loss.reduce(device)
+        if params.compute_valid_wer:
+            s = torch.tensor(
+                [tot_errs, tot_ref_len, tot_ins, tot_del, tot_sub],
+                device=device,
+                dtype=torch.long,
+            )
+            torch.distributed.all_reduce(s, op=torch.distributed.ReduceOp.SUM)
+            tot_errs, tot_ref_len, tot_ins, tot_del, tot_sub = s.cpu().tolist()
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
-    return tot_loss
+    wer_stats = None
+    if params.compute_valid_wer:
+        denom = max(1, tot_ref_len)
+        wer_stats = {
+            "wer": tot_errs / denom,
+            "errors": float(tot_errs),
+            "ref_len": float(tot_ref_len),
+            "ins": float(tot_ins),
+            "del": float(tot_del),
+            "sub": float(tot_sub),
+        }
+
+    return tot_loss, wer_stats
 
 
 def train_one_epoch(
@@ -1092,7 +1265,7 @@ def train_one_epoch(
 
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
+            valid_info, wer_stats = compute_validation_loss(
                 params=params,
                 model=model,
                 sp=sp,
@@ -1101,6 +1274,13 @@ def train_one_epoch(
             )
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
+            if wer_stats is not None:
+                logging.info(
+                    f"[valid] %WER {wer_stats['wer']:.2%} "
+                    f"[{int(wer_stats['errors'])} / {int(wer_stats['ref_len'])}, "
+                    f"{int(wer_stats['ins'])} ins, {int(wer_stats['del'])} del, "
+                    f"{int(wer_stats['sub'])} sub ]"
+                )
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
             )
@@ -1108,6 +1288,10 @@ def train_one_epoch(
                 valid_info.write_summary(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
+                if wer_stats is not None:
+                    tb_writer.add_scalar(
+                        "train/valid_wer", wer_stats["wer"], params.batch_idx_train
+                    )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
@@ -1237,13 +1421,23 @@ def run(rank, world_size, args):
 
         # In ./zipformer.py, the conv module uses the following expression
         # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
+        num_frames = c.num_frames
+        if num_frames is None:
+            # When using on-the-fly feature extraction, cuts might not have
+            # precomputed feature metadata. Estimate the frame count using
+            # fbank defaults (10ms frame shift).
+            sampling_rate = c.sampling_rate if c.sampling_rate is not None else 16000
+            num_frames = compute_num_frames(
+                duration=c.duration, frame_shift=0.01, sampling_rate=sampling_rate
+            )
+
+        T = ((num_frames - 7) // 2 + 1) // 2
         tokens = sp.encode(c.supervisions[0].text, out_type=str)
 
         if T < len(tokens):
             logging.warning(
                 f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
+                f"Number of frames (before subsampling): {num_frames}. "
                 f"Number of frames (after subsampling): {T}. "
                 f"Text: {c.supervisions[0].text}. "
                 f"Tokens: {tokens}. "
@@ -1269,7 +1463,7 @@ def run(rank, world_size, args):
     valid_cuts = multi_dataset.dev_cuts()
     valid_dl = data_module.valid_dataloaders(valid_cuts)
 
-    if not params.print_diagnostics:
+    if not params.print_diagnostics and not params.skip_oom_check:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
