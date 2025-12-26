@@ -116,6 +116,16 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
                 - if use "char", derived from unfiltered character & symbol counts of custom dataset
                 - if use "byte", set to 256 (unicode byte range)
     """
+    def _decode_vocab_symbol(symbol: str) -> str:
+        # Allow writing unsafe/hidden Unicode characters as placeholders
+        # like "U+202E" in vocab files and decode them at load time.
+        if symbol.startswith("U+") and len(symbol) in (6, 8):
+            try:
+                return chr(int(symbol[2:], 16))
+            except ValueError:
+                return symbol
+        return symbol
+
     if tokenizer in ["pinyin", "char"]:
         tokenizer_path = os.path.join(
             files("f5_tts").joinpath("../../data"),
@@ -124,7 +134,7 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
         with open(tokenizer_path, "r", encoding="utf-8") as f:
             vocab_char_map = {}
             for i, char in enumerate(f):
-                vocab_char_map[char[:-1]] = i
+                vocab_char_map[_decode_vocab_symbol(char.rstrip("\n"))] = i
         vocab_size = len(vocab_char_map)
         assert (
             vocab_char_map[" "] == 0
@@ -138,7 +148,7 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
         with open(dataset_name, "r", encoding="utf-8") as f:
             vocab_char_map = {}
             for i, char in enumerate(f):
-                vocab_char_map[char[:-1]] = i
+                vocab_char_map[_decode_vocab_symbol(char.rstrip("\n"))] = i
         vocab_size = len(vocab_char_map)
 
     return vocab_char_map, vocab_size

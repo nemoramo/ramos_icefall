@@ -354,7 +354,8 @@ def get_parser():
         "--valid-interval",
         type=int,
         default=3000,
-        help="Run validation every N batches (per epoch).",
+        help="Run validation every N training batches (per epoch). "
+        "Note: validation also runs at batch 0.",
     )
 
     parser.add_argument(

@@ -299,7 +299,8 @@ def get_parser():
         "--valid-interval",
         type=int,
         default=3000,
-        help="Run validation every N batches (per epoch).",
+        help="Run validation every N training batches (per epoch). "
+        "Note: validation also runs at batch 0.",
     )
 
     parser.add_argument(
@@ -1276,7 +1277,7 @@ def train_one_epoch(
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if wer_stats is not None:
                 logging.info(
-                    f"[valid] %WER {wer_stats['wer']:.2%} "
+                    f"[valid] %CER {wer_stats['wer']:.2%} "
                     f"[{int(wer_stats['errors'])} / {int(wer_stats['ref_len'])}, "
                     f"{int(wer_stats['ins'])} ins, {int(wer_stats['del'])} del, "
                     f"{int(wer_stats['sub'])} sub ]"
@@ -1291,6 +1292,9 @@ def train_one_epoch(
                 if wer_stats is not None:
                     tb_writer.add_scalar(
                         "train/valid_wer", wer_stats["wer"], params.batch_idx_train
+                    )
+                    tb_writer.add_scalar(
+                        "train/valid_cer", wer_stats["wer"], params.batch_idx_train
                     )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
