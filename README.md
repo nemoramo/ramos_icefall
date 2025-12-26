@@ -50,7 +50,7 @@ If TensorBoard is enabled (`--tensorboard true`), WER is also logged as:
 
 - `train/valid_wer`
 
-For `multi_zh-hans`, the same value is also logged as:
+For `multi_zh-hans`, validation computes **CER** and logs:
 
 - `train/valid_cer`
 
@@ -66,5 +66,5 @@ For datasets with mixed encodings/sampling rates or slightly inaccurate `duratio
 
 - Prefer torchaudio backend: `export LHOTSE_AUDIO_BACKEND=TorchaudioDefaultBackend`
 - Resample when using on-the-fly fbank: `--on-the-fly-feats true --resample-to 16000`
-- If you see duration mismatch errors, increase tolerance (seconds), e.g.:
-  `export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.2`
+- If you see `AudioLoadingError` about declared/loaded samples mismatch, increase tolerance (seconds), e.g.:
+  `export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.2` (or larger for noisy manifests, e.g. `60`)
