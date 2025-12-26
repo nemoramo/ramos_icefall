@@ -839,11 +839,14 @@ def compute_loss(
         disables autograd.
       return_encoder_out:
         If True, also return (encoder_out, encoder_out_lens) so validation can
-        decode without re-running the encoder.
+        decode without re-running the encoder. If the model does not support
+        this kwarg, we will fall back to re-running forward_encoder only when
+        return_encoder_out=True.
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    asr_model = model.module if isinstance(model, DDP) else model
+    device = next(asr_model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -863,18 +866,61 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        out = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-            return_encoder_out=return_encoder_out,
-        )
-        simple_loss, pruned_loss, ctc_loss = out[:3]
+        # NOTE: Only pass `return_encoder_out` if the underlying model supports it.
+        # This avoids hard failures when swapping in alternative model implementations.
         if return_encoder_out:
-            encoder_out, encoder_out_lens = out[-2], out[-1]
+            import inspect
+
+            supports = getattr(asr_model, "_supports_return_encoder_out", None)
+            if supports is None:
+                try:
+                    supports = (
+                        "return_encoder_out"
+                        in inspect.signature(asr_model.forward).parameters
+                    )
+                except (TypeError, ValueError):
+                    supports = False
+                setattr(asr_model, "_supports_return_encoder_out", supports)
+
+            if supports:
+                out = model(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                    return_encoder_out=True,
+                )
+                encoder_out, encoder_out_lens = out[-2], out[-1]
+            else:
+                out = model(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                )
+                if not hasattr(asr_model, "forward_encoder"):
+                    raise RuntimeError(
+                        "return_encoder_out=True but model does not support "
+                        "return_encoder_out and has no forward_encoder() for fallback."
+                    )
+                encoder_out, encoder_out_lens = asr_model.forward_encoder(
+                    feature, feature_lens
+                )
+        else:
+            out = model(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+            )
+
+        simple_loss, pruned_loss, ctc_loss = out[:3]
 
         loss = 0.0
 
