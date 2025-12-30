@@ -148,7 +148,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/data1/mayufeng/spgispeech/tmp_forcealign",
+        default="tmp_forcealign",
         help="Directory to write json/md outputs.",
     )
     return parser
