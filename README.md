@@ -5,6 +5,10 @@ This repository is a working fork of `k2-fsa/icefall` (ASR recipes built on `k2`
 - Legacy project overview: `README.legacy.md`
 - Recipes live under `egs/<dataset>/<task>/...` (each recipe has its own README/RESULTS where applicable)
 
+## Tools
+
+- Force-alignment CLI: `tools/force_align.py` (usage + design notes: `tools/README.md`)
+
 ## Validation with WER (during training)
 
 Some training scripts can compute and log **WER/CER during validation** (in addition to loss) using
