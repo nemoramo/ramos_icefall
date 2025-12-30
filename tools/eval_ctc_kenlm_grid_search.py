@@ -273,13 +273,19 @@ def _nbest_from_ctc(
     ctc_logits: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     beam: int,
+    blank_id: int,
     process_pool,
 ) -> List[HypothesisList]:
     # Detach to avoid autograd tensors crossing process boundaries inside
     # `ctc_prefix_beam_search` (it uses multiprocessing for decoding).
-    log_probs = ctc_logits.log_softmax(dim=-1).detach()
+    log_probs = ctc_logits.float().log_softmax(dim=-1).detach()
     return ctc_prefix_beam_search(
-        log_probs, encoder_out_lens, beam=beam, blank_id=0, process_pool=process_pool, return_nbest=True
+        log_probs,
+        encoder_out_lens,
+        beam=beam,
+        blank_id=int(blank_id),
+        process_pool=process_pool,
+        return_nbest=True,
     )
 
 
@@ -343,6 +349,8 @@ def _grid_search_alpha_beta(
     alpha_list: List[float],
     beta_list: List[float],
     process_pool,
+    sample_rate: int,
+    blank_id: int,
 ) -> Tuple[float, float, Dict[str, Any]]:
     if not alpha_list or not beta_list:
         raise ValueError("alpha_list and beta_list must be non-empty for grid search.")
@@ -374,6 +382,7 @@ def _grid_search_alpha_beta(
             ctc_logits=ctc_logits,
             encoder_out_lens=encoder_out_lens,
             beam=beam,
+            blank_id=blank_id,
             process_pool=process_pool,
         )
 
@@ -411,14 +420,31 @@ def _grid_search_alpha_beta(
         feats_cpu_list = []
         utt_batch = []
 
+    target_sr = int(sample_rate)
     for utt in dev_utts:
-        wav, sr = torchaudio.load(utt.audio_filepath)
-        if wav.dim() == 2:
-            wav = wav[0]
-        if int(sr) != 16000:
-            wav = torchaudio.functional.resample(wav, int(sr), 16000)
-            sr = 16000
-        feats = _compute_fbank(wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim)
+        try:
+            wav, sr = torchaudio.load(utt.audio_filepath)
+            if wav.dim() == 2:
+                wav = wav[0]
+            if int(sr) != target_sr:
+                wav = torchaudio.functional.resample(wav, int(sr), target_sr)
+                sr = target_sr
+            feats = _compute_fbank(wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim)
+        except Exception:
+            # Treat as empty hypothesis (all deletions) for every (alpha,beta).
+            ref_norm = _normalize_for_wer(utt.text)
+            ref_tokens = ref_norm.split() if ref_norm else []
+            for ci in range(len(combos)):
+                dels[ci] += len(ref_tokens)
+                ref_lens[ci] += len(ref_tokens)
+            n += 1
+            if n % 200 == 0:
+                dt = time.time() - t0
+                print(
+                    f"[grid] {n}/{len(dev_utts)} utts processed ({n/max(1e-6,dt):.2f} utt/s)"
+                )
+            continue
+
         feats_cpu_list.append(feats.cpu())
         utt_batch.append(utt)
         if len(utt_batch) >= batch_size:
@@ -469,6 +495,8 @@ def _decode_manifest_with_fixed_alpha_beta(
     beam: int,
     process_pool,
     out_path: Path,
+    sample_rate: int,
+    blank_id: int,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -493,6 +521,7 @@ def _decode_manifest_with_fixed_alpha_beta(
                 ctc_logits=ctc_logits,
                 encoder_out_lens=encoder_out_lens,
                 beam=beam,
+                blank_id=blank_id,
                 process_pool=process_pool,
             )
 
@@ -531,14 +560,38 @@ def _decode_manifest_with_fixed_alpha_beta(
             feats_cpu_list = []
             utt_batch = []
 
+        target_sr = int(sample_rate)
         for utt in utts:
-            wav, sr = torchaudio.load(utt.audio_filepath)
-            if wav.dim() == 2:
-                wav = wav[0]
-            if int(sr) != 16000:
-                wav = torchaudio.functional.resample(wav, int(sr), 16000)
-                sr = 16000
-            feats = _compute_fbank(wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim)
+            try:
+                wav, sr = torchaudio.load(utt.audio_filepath)
+                if wav.dim() == 2:
+                    wav = wav[0]
+                if int(sr) != target_sr:
+                    wav = torchaudio.functional.resample(wav, int(sr), target_sr)
+                    sr = target_sr
+                feats = _compute_fbank(wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim)
+            except Exception as e:
+                obj = {
+                    "utt_id": utt.utt_id,
+                    "audio_filepath": utt.audio_filepath,
+                    "text": utt.text,
+                    "pred_text": "",
+                    "model_name": spec.name,
+                    "ckpt": spec.ckpt,
+                    "beam": int(beam),
+                    "alpha": float(alpha),
+                    "beta": float(beta),
+                    "beta_unit": str(beta_unit),
+                    "error": repr(e),
+                }
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                n += 1
+                if n % 2000 == 0:
+                    dt = time.time() - t0
+                    print(f"[decode] {n}/{len(utts)} ({n/max(1e-6,dt):.2f} utt/s)")
+                    f.flush()
+                continue
+
             feats_cpu_list.append(feats.cpu())
             utt_batch.append(utt)
             if len(utt_batch) >= batch_size:
@@ -576,6 +629,7 @@ def _run_speech_related_tools_eval(
         str(report_path),
         "--max-align",
         str(int(max_align)),
+        "--quiet",
     ]
     if align_out is not None:
         cmd += ["--align-out", str(align_out)]
@@ -610,8 +664,6 @@ def get_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--dev-manifest", type=str, default=None)
     p.add_argument("--test-manifest", type=str, default=None)
-    p.add_argument("--wav-scp", type=str, default=None)
-    p.add_argument("--text", type=str, default=None)
 
     p.add_argument(
         "--dev-num-utts",
@@ -636,6 +688,8 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--beam", type=int, default=25, help="CTC prefix beam size (nbest size).")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--sample-rate", type=int, default=16000)
+    p.add_argument("--blank-id", type=int, default=0)
 
     p.add_argument("--prefer-chunk-size", type=int, default=64)
     p.add_argument("--prefer-left-context-frames", type=int, default=256)
@@ -744,6 +798,8 @@ def main() -> None:
         "kenlm_model": str(args.kenlm_model),
         "beam": int(args.beam),
         "batch_size": int(args.batch_size),
+        "sample_rate": int(args.sample_rate),
+        "blank_id": int(args.blank_id),
         "alpha_list": [float(x) for x in alpha_list],
         "beta_list": [float(x) for x in beta_list],
         "beta_unit": str(args.beta_unit),
@@ -758,8 +814,18 @@ def main() -> None:
 
     from multiprocessing import get_context
 
-    ctx = get_context("fork")
-    pool = ctx.Pool(processes=int(args.num_decode_workers)) if int(args.num_decode_workers) > 0 else None
+    start_method = "fork"
+    if os.name != "posix" or sys.platform == "darwin":
+        start_method = "spawn"
+    try:
+        ctx = get_context(start_method)
+    except ValueError:
+        ctx = get_context()
+    pool = (
+        ctx.Pool(processes=int(args.num_decode_workers))
+        if int(args.num_decode_workers) > 0
+        else None
+    )
 
     try:
         for ckpt_path, model_name in zip(ckpts, names):
@@ -790,6 +856,8 @@ def main() -> None:
                 alpha_list=alpha_list,
                 beta_list=beta_list,
                 process_pool=pool,
+                sample_rate=int(args.sample_rate),
+                blank_id=int(args.blank_id),
             )
             print(
                 f"[grid] best alpha={best_alpha:.3f} beta={best_beta:.3f} wer={grid_summary['best_wer']:.4f}"
@@ -811,6 +879,8 @@ def main() -> None:
                 beam=int(args.beam),
                 process_pool=pool,
                 out_path=test_pred_path,
+                sample_rate=int(args.sample_rate),
+                blank_id=int(args.blank_id),
             )
 
             report_path = run_dir / f"test_report_{_safe_name(model_name)}.json"

@@ -16,6 +16,7 @@ import argparse
 import json
 import random
 import re
+import sys
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -26,7 +27,10 @@ import sentencepiece as spm
 import torch
 import torchaudio
 
-from tools.force_align import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.force_align import (  # noqa: E402
     LOG_EPS,
     ModelSpec,
     Utterance,
@@ -180,7 +184,7 @@ def _build_models(
     models: List[torch.nn.Module] = []
 
     for ckpt_path, model_name in zip(ckpts, names):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         causal = bool(ckpt.get("causal", False))
         subsampling_factor = int(ckpt.get("subsampling_factor", 4))
         feature_dim = int(ckpt.get("feature_dim", 80))
@@ -347,6 +351,11 @@ def _open_out_files(
     out: Dict[str, tuple[Path, TextIO]] = {}
     for spec in model_specs:
         name = _safe_name(spec.name)
+        if name in out:
+            raise ValueError(
+                f"Duplicate sanitized model name {name!r}. "
+                "Please pass unique --name values."
+            )
         path = out_dir / f"{prefix}_{name}_{ts}_{rid}.jsonl"
         out[name] = (path, path.open("w", encoding="utf-8"))
     return out
@@ -412,12 +421,16 @@ def main() -> None:
         batch_size = 1
 
     out_dir = Path(args.output_dir)
-    prefix = (
-        args.output_prefix
-        or Path(args.manifest).stem
-        if args.manifest is not None
-        else "decoded"
-    )
+    manifest_for_prefix = args.manifest or _cfg_get(cfg, "input.manifest", None)
+    wav_scp_for_prefix = args.wav_scp or _cfg_get(cfg, "input.wav_scp", None)
+    if args.output_prefix:
+        prefix = args.output_prefix
+    elif manifest_for_prefix:
+        prefix = Path(str(manifest_for_prefix)).stem
+    elif wav_scp_for_prefix:
+        prefix = Path(str(wav_scp_for_prefix)).stem
+    else:
+        prefix = "decoded"
     prefix = _safe_name(prefix)
 
     out_files = _open_out_files(out_dir=out_dir, prefix=prefix, model_specs=model_specs)

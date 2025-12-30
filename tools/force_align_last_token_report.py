@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -29,9 +30,12 @@ import sentencepiece as spm
 import torch
 import torchaudio
 
-from icefall.forced_alignment import ForcedAlignmentResult, force_align
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-from tools.force_align import (
+from icefall.forced_alignment import ForcedAlignmentResult, force_align  # noqa: E402
+
+from tools.force_align import (  # noqa: E402
     LOG_EPS,
     ModelSpec,
     Utterance,
@@ -182,7 +186,7 @@ def _build_models(
     models: List[torch.nn.Module] = []
 
     for ckpt_path, model_name in zip(ckpts, names):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         causal = bool(ckpt.get("causal", False))
         subsampling_factor = int(ckpt.get("subsampling_factor", 4))
         feature_dim = int(ckpt.get("feature_dim", 80))
@@ -498,4 +502,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -268,7 +268,7 @@ def _load_model_from_ckpt(
     override_chunk_size: Optional[int] = None,
     override_left_context_frames: Optional[int] = None,
 ) -> Tuple[nn.Module, Dict[str, Any], Dict[str, Any]]:
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     skip = {
         "model",
@@ -534,7 +534,7 @@ def _infer_bpe_model(args_bpe: Optional[str], cfg: Dict[str, Any], ckpts: List[s
     if cfg_bpe:
         return str(cfg_bpe)
     # Best-effort: use bpe_model recorded in the first checkpoint.
-    ckpt0 = torch.load(ckpts[0], map_location="cpu")
+    ckpt0 = torch.load(ckpts[0], map_location="cpu", weights_only=False)
     bpe = ckpt0.get("bpe_model")
     if not bpe:
         raise ValueError("Missing --bpe-model (and could not infer from checkpoint).")
@@ -746,7 +746,7 @@ def main() -> None:
     override_lcf = int(override_lcf) if override_lcf is not None else None
 
     for ckpt_path, model_name in zip(ckpts, names):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         causal = bool(ckpt.get("causal", False))
         subsampling_factor = int(ckpt.get("subsampling_factor", 4))
         feature_dim = int(ckpt.get("feature_dim", 80))
