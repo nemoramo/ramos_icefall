@@ -16,6 +16,7 @@ import argparse
 import json
 import random
 import re
+import sys
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -26,7 +27,10 @@ import sentencepiece as spm
 import torch
 import torchaudio
 
-from tools.force_align import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.force_align import (  # noqa: E402
     LOG_EPS,
     ModelSpec,
     Utterance,
@@ -99,6 +103,7 @@ def get_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--blank-id", type=int, default=0)
 
     # Streaming params (used only when ckpt has causal=True).
     parser.add_argument(
@@ -180,7 +185,7 @@ def _build_models(
     models: List[torch.nn.Module] = []
 
     for ckpt_path, model_name in zip(ckpts, names):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         causal = bool(ckpt.get("causal", False))
         subsampling_factor = int(ckpt.get("subsampling_factor", 4))
         feature_dim = int(ckpt.get("feature_dim", 80))
@@ -265,6 +270,7 @@ def _decode_one_utt_ctc(
     device: torch.device,
     sample_rate: int,
     causal_forward_mode: str,
+    blank_id: int,
 ) -> Dict[str, Any]:
     if sr != int(sample_rate):
         wav = torchaudio.functional.resample(wav, sr, int(sample_rate))
@@ -289,7 +295,7 @@ def _decode_one_utt_ctc(
             enc, enc_lens = _compute_offline_encoder_out(model, feats)
 
         ctc_output = model.ctc_output(enc)  # (N=1, T, vocab)
-        hyp_ids = _ctc_greedy_search(ctc_output, enc_lens, blank_id=0)[0]
+        hyp_ids = _ctc_greedy_search(ctc_output, enc_lens, blank_id=int(blank_id))[0]
         hyp_text = sp.decode_ids(hyp_ids).strip()
         per_model[spec.name] = {"pred_text": hyp_text}
 
@@ -310,6 +316,7 @@ def _decode_batch_ctc_offline(
     model_specs: List[ModelSpec],
     models: List[torch.nn.Module],
     device: torch.device,
+    blank_id: int,
 ) -> Dict[str, List[str]]:
     if not utts:
         return {}
@@ -329,7 +336,7 @@ def _decode_batch_ctc_offline(
     for spec, model in zip(model_specs, models):
         enc, enc_lens = model.forward_encoder(feats, feats_lens)
         ctc_output = model.ctc_output(enc)
-        hyp_ids_list = _ctc_greedy_search(ctc_output, enc_lens, blank_id=0)
+        hyp_ids_list = _ctc_greedy_search(ctc_output, enc_lens, blank_id=int(blank_id))
         out[spec.name] = [sp.decode_ids(h).strip() for h in hyp_ids_list]
     return out
 
@@ -347,6 +354,11 @@ def _open_out_files(
     out: Dict[str, tuple[Path, TextIO]] = {}
     for spec in model_specs:
         name = _safe_name(spec.name)
+        if name in out:
+            raise ValueError(
+                f"Duplicate sanitized model name {name!r}. "
+                "Please pass unique --name values."
+            )
         path = out_dir / f"{prefix}_{name}_{ts}_{rid}.jsonl"
         out[name] = (path, path.open("w", encoding="utf-8"))
     return out
@@ -412,12 +424,16 @@ def main() -> None:
         batch_size = 1
 
     out_dir = Path(args.output_dir)
-    prefix = (
-        args.output_prefix
-        or Path(args.manifest).stem
-        if args.manifest is not None
-        else "decoded"
-    )
+    manifest_for_prefix = args.manifest or _cfg_get(cfg, "input.manifest", None)
+    wav_scp_for_prefix = args.wav_scp or _cfg_get(cfg, "input.wav_scp", None)
+    if args.output_prefix:
+        prefix = args.output_prefix
+    elif manifest_for_prefix:
+        prefix = Path(str(manifest_for_prefix)).stem
+    elif wav_scp_for_prefix:
+        prefix = Path(str(wav_scp_for_prefix)).stem
+    else:
+        prefix = "decoded"
     prefix = _safe_name(prefix)
 
     out_files = _open_out_files(out_dir=out_dir, prefix=prefix, model_specs=model_specs)
@@ -463,6 +479,7 @@ def main() -> None:
                         device=device,
                         sample_rate=int(args.sample_rate),
                         causal_forward_mode=str(args.causal_forward),
+                        blank_id=int(args.blank_id),
                     )
                     error: Optional[str] = None
                 except Exception as e:
@@ -487,6 +504,8 @@ def main() -> None:
                         "model_name": spec.name,
                         "ckpt": spec.ckpt,
                         "causal_forward": str(args.causal_forward),
+                        "sample_rate": int(args.sample_rate),
+                        "blank_id": int(args.blank_id),
                     }
                     if error is not None:
                         out_obj["error"] = error
@@ -510,6 +529,7 @@ def main() -> None:
                     model_specs=model_specs,
                     models=models,
                     device=device,
+                    blank_id=int(args.blank_id),
                 )
                 for i, utt in enumerate(utt_batch):
                     for spec in model_specs:
@@ -523,6 +543,8 @@ def main() -> None:
                             "model_name": spec.name,
                             "ckpt": spec.ckpt,
                             "causal_forward": str(args.causal_forward),
+                            "sample_rate": int(args.sample_rate),
+                            "blank_id": int(args.blank_id),
                         }
                         f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
                     n += 1
@@ -560,6 +582,8 @@ def main() -> None:
                             "model_name": spec.name,
                             "ckpt": spec.ckpt,
                             "causal_forward": str(args.causal_forward),
+                            "sample_rate": int(args.sample_rate),
+                            "blank_id": int(args.blank_id),
                             "error": error,
                         }
                         f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")

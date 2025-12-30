@@ -198,7 +198,7 @@ def _rnnt_greedy_search_batch(
     for t, batch_size in enumerate(batch_size_list):
         start = offset
         end = offset + batch_size
-        current_enc = enc_proj.data[start:end]
+        current_enc = enc_proj[start:end]
         current_enc = current_enc.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, enc_dim)
         offset = end
 
@@ -207,7 +207,7 @@ def _rnnt_greedy_search_batch(
         logits = model.joiner(current_enc, decoder_out.unsqueeze(1), project_input=False)
         logits = logits.squeeze(1).squeeze(1)  # (B, vocab)
         if blank_penalty != 0.0:
-            logits[:, 0] -= float(blank_penalty)
+            logits[:, blank_id] -= float(blank_penalty)
 
         y = logits.argmax(dim=1).tolist()
         emitted = False
@@ -295,6 +295,7 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--blank-penalty", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--sample-rate", type=int, default=16000)
 
     p.add_argument("--prefer-chunk-size", type=int, default=64)
     p.add_argument("--prefer-left-context-frames", type=int, default=256)
@@ -365,6 +366,7 @@ def main() -> None:
         "beam": int(args.beam),
         "blank_penalty": float(args.blank_penalty),
         "batch_size": int(args.batch_size),
+        "sample_rate": int(args.sample_rate),
         "models": [],
     }
 
@@ -423,6 +425,7 @@ def main() -> None:
                         "ckpt": spec.ckpt,
                         "decoding": "rnnt_greedy",
                         "blank_penalty": float(args.blank_penalty),
+                        "sample_rate": int(args.sample_rate),
                     }
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
                     n += 1
@@ -434,14 +437,39 @@ def main() -> None:
                 feats_cpu_list = []
                 utt_batch = []
 
+            target_sr = int(args.sample_rate)
             for utt in utts:
-                wav, sr = torchaudio.load(utt.audio_filepath)
-                if wav.dim() == 2:
-                    wav = wav[0]
-                if int(sr) != 16000:
-                    wav = torchaudio.functional.resample(wav, int(sr), 16000)
-                    sr = 16000
-                feats = _compute_fbank(wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim)
+                try:
+                    wav, sr = torchaudio.load(utt.audio_filepath)
+                    if wav.dim() == 2:
+                        wav = wav[0]
+                    if int(sr) != target_sr:
+                        wav = torchaudio.functional.resample(wav, int(sr), target_sr)
+                        sr = target_sr
+                    feats = _compute_fbank(
+                        wav, int(sr), device=cpu, num_mel_bins=spec.feature_dim
+                    )
+                except Exception as e:
+                    obj = {
+                        "utt_id": utt.utt_id,
+                        "audio_filepath": utt.audio_filepath,
+                        "text": utt.text,
+                        "pred_text": "",
+                        "model_name": spec.name,
+                        "ckpt": spec.ckpt,
+                        "decoding": "rnnt_greedy",
+                        "blank_penalty": float(args.blank_penalty),
+                        "sample_rate": int(args.sample_rate),
+                        "error": repr(e),
+                    }
+                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                    n += 1
+                    if n % 2000 == 0:
+                        dt = time.time() - t0
+                        print(f"[decode] {n}/{len(utts)} ({n/max(1e-6,dt):.2f} utt/s)")
+                        f.flush()
+                    continue
+
                 feats_cpu_list.append(feats.cpu())
                 utt_batch.append(utt)
                 if len(utt_batch) >= int(args.batch_size):
@@ -504,4 +532,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
