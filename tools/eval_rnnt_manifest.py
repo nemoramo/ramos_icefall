@@ -366,6 +366,7 @@ def main() -> None:
         "beam": int(args.beam),
         "blank_penalty": float(args.blank_penalty),
         "batch_size": int(args.batch_size),
+        "sample_rate": int(args.sample_rate),
         "models": [],
     }
 
@@ -424,6 +425,7 @@ def main() -> None:
                         "ckpt": spec.ckpt,
                         "decoding": "rnnt_greedy",
                         "blank_penalty": float(args.blank_penalty),
+                        "sample_rate": int(args.sample_rate),
                     }
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
                     n += 1
@@ -457,6 +459,7 @@ def main() -> None:
                         "ckpt": spec.ckpt,
                         "decoding": "rnnt_greedy",
                         "blank_penalty": float(args.blank_penalty),
+                        "sample_rate": int(args.sample_rate),
                         "error": repr(e),
                     }
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")

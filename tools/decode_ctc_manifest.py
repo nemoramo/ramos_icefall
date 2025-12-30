@@ -103,6 +103,7 @@ def get_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--blank-id", type=int, default=0)
 
     # Streaming params (used only when ckpt has causal=True).
     parser.add_argument(
@@ -269,6 +270,7 @@ def _decode_one_utt_ctc(
     device: torch.device,
     sample_rate: int,
     causal_forward_mode: str,
+    blank_id: int,
 ) -> Dict[str, Any]:
     if sr != int(sample_rate):
         wav = torchaudio.functional.resample(wav, sr, int(sample_rate))
@@ -293,7 +295,7 @@ def _decode_one_utt_ctc(
             enc, enc_lens = _compute_offline_encoder_out(model, feats)
 
         ctc_output = model.ctc_output(enc)  # (N=1, T, vocab)
-        hyp_ids = _ctc_greedy_search(ctc_output, enc_lens, blank_id=0)[0]
+        hyp_ids = _ctc_greedy_search(ctc_output, enc_lens, blank_id=int(blank_id))[0]
         hyp_text = sp.decode_ids(hyp_ids).strip()
         per_model[spec.name] = {"pred_text": hyp_text}
 
@@ -314,6 +316,7 @@ def _decode_batch_ctc_offline(
     model_specs: List[ModelSpec],
     models: List[torch.nn.Module],
     device: torch.device,
+    blank_id: int,
 ) -> Dict[str, List[str]]:
     if not utts:
         return {}
@@ -333,7 +336,7 @@ def _decode_batch_ctc_offline(
     for spec, model in zip(model_specs, models):
         enc, enc_lens = model.forward_encoder(feats, feats_lens)
         ctc_output = model.ctc_output(enc)
-        hyp_ids_list = _ctc_greedy_search(ctc_output, enc_lens, blank_id=0)
+        hyp_ids_list = _ctc_greedy_search(ctc_output, enc_lens, blank_id=int(blank_id))
         out[spec.name] = [sp.decode_ids(h).strip() for h in hyp_ids_list]
     return out
 
@@ -476,6 +479,7 @@ def main() -> None:
                         device=device,
                         sample_rate=int(args.sample_rate),
                         causal_forward_mode=str(args.causal_forward),
+                        blank_id=int(args.blank_id),
                     )
                     error: Optional[str] = None
                 except Exception as e:
@@ -500,6 +504,8 @@ def main() -> None:
                         "model_name": spec.name,
                         "ckpt": spec.ckpt,
                         "causal_forward": str(args.causal_forward),
+                        "sample_rate": int(args.sample_rate),
+                        "blank_id": int(args.blank_id),
                     }
                     if error is not None:
                         out_obj["error"] = error
@@ -523,6 +529,7 @@ def main() -> None:
                     model_specs=model_specs,
                     models=models,
                     device=device,
+                    blank_id=int(args.blank_id),
                 )
                 for i, utt in enumerate(utt_batch):
                     for spec in model_specs:
@@ -536,6 +543,8 @@ def main() -> None:
                             "model_name": spec.name,
                             "ckpt": spec.ckpt,
                             "causal_forward": str(args.causal_forward),
+                            "sample_rate": int(args.sample_rate),
+                            "blank_id": int(args.blank_id),
                         }
                         f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
                     n += 1
@@ -573,6 +582,8 @@ def main() -> None:
                             "model_name": spec.name,
                             "ckpt": spec.ckpt,
                             "causal_forward": str(args.causal_forward),
+                            "sample_rate": int(args.sample_rate),
+                            "blank_id": int(args.blank_id),
                             "error": error,
                         }
                         f.write(json.dumps(out_obj, ensure_ascii=False) + "\n")

@@ -548,6 +548,8 @@ def _decode_manifest_with_fixed_alpha_beta(
                     "alpha": float(alpha),
                     "beta": float(beta),
                     "beta_unit": str(beta_unit),
+                    "sample_rate": int(sample_rate),
+                    "blank_id": int(blank_id),
                 }
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
@@ -582,6 +584,8 @@ def _decode_manifest_with_fixed_alpha_beta(
                     "alpha": float(alpha),
                     "beta": float(beta),
                     "beta_unit": str(beta_unit),
+                    "sample_rate": int(sample_rate),
+                    "blank_id": int(blank_id),
                     "error": repr(e),
                 }
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -931,7 +935,10 @@ def main() -> None:
         lines.append(f"- DEV samples: {len(dev_utts)} (seed={args.dev_seed})")
         lines.append(f"- TEST manifest: `{test_manifest}`")
         lines.append(f"- KenLM: `{args.kenlm_model}`")
-        lines.append(f"- Beam: {args.beam}, batch_size: {args.batch_size}")
+        lines.append(
+            f"- Beam: {args.beam}, batch_size: {args.batch_size}, sample_rate: {args.sample_rate}, "
+            f"blank_id: {args.blank_id}, beta_unit: {args.beta_unit}"
+        )
         lines.append("")
         lines.append("## Results (TEST)")
         for m in summary["models"]:
