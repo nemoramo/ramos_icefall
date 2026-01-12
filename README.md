@@ -7,7 +7,7 @@ This repository is a working fork of `k2-fsa/icefall` (ASR recipes built on `k2`
 
 ## Tools
 
-- Force-alignment CLI: `tools/force_align.py` (usage + design notes: `tools/README.md`)
+- Force-alignment CLI: `tools/force_align.py` (supports `--with-confidence`; usage + design notes: `tools/README.md`)
 
 ## Validation with WER (during training)
 

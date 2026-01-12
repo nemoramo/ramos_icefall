@@ -12,7 +12,7 @@ Highlights
       * a JSONL manifest with `audio_filepath` and `text`
       * Kaldi-style `wav.scp` + `text`
       * a single `--audio` + `--transcript`
-  - Prints one line per checkpoint with per-word timestamps.
+  - Prints one line per checkpoint with per-word timestamps (and optional confidence).
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ class WordSpan:
     word: str
     start: float
     end: Optional[float] = None
+    confidence: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -456,6 +457,7 @@ def _tokens_to_word_spans(
     tokens: List[str],
     token_start_times: List[float],
     token_durations: Optional[List[float]],
+    token_scores: Optional[List[float]],
 ) -> List[WordSpan]:
     if not tokens:
         return []
@@ -465,20 +467,34 @@ def _tokens_to_word_spans(
     if token_durations is not None and len(token_durations) != len(tokens):
         raise ValueError("token_durations length mismatch")
 
+    if token_scores is not None and len(token_scores) != len(tokens):
+        raise ValueError("token_scores length mismatch")
+
     word_pieces: List[str] = []
     word_start: Optional[float] = None
     word_end: Optional[float] = None
+
+    score_sum = 0.0
+    score_weight_sum = 0.0
+
     out: List[WordSpan] = []
 
     def flush() -> None:
-        nonlocal word_pieces, word_start, word_end, out
+        nonlocal word_pieces, word_start, word_end, score_sum, score_weight_sum, out
         if not word_pieces:
             return
         word = sp.decode_pieces(word_pieces).strip()
-        out.append(WordSpan(word=word, start=float(word_start), end=word_end))
+        confidence = None
+        if score_weight_sum > 0:
+            confidence = float(score_sum / score_weight_sum)
+        out.append(
+            WordSpan(word=word, start=float(word_start), end=word_end, confidence=confidence)
+        )
         word_pieces = []
         word_start = None
         word_end = None
+        score_sum = 0.0
+        score_weight_sum = 0.0
 
     for token_index, token in enumerate(tokens):
         start = float(token_start_times[token_index])
@@ -486,6 +502,7 @@ def _tokens_to_word_spans(
             float(token_durations[token_index]) if token_durations is not None else None
         )
         end = (start + dur) if dur is not None else None
+        score = float(token_scores[token_index]) if token_scores is not None else None
 
         is_boundary = token.startswith("▁")
         is_pure_boundary = token == "▁"
@@ -502,10 +519,15 @@ def _tokens_to_word_spans(
             continue
 
         if not word_pieces:
-            word_start = start
+            if word_start is None:
+                word_start = start
         word_pieces.append(token)
         if end is not None:
             word_end = end
+        if score is not None:
+            weight = dur if dur is not None and dur > 0 else 1.0
+            score_sum += score * weight
+            score_weight_sum += weight
 
     flush()
     return out
@@ -516,15 +538,27 @@ def _render_word_line(
     model_name: str,
     spans: List[WordSpan],
     with_end: bool,
+    with_confidence: bool,
     sep: str,
 ) -> str:
     parts: List[str] = [model_name]
     for span in spans:
+        has_confidence = with_confidence and span.confidence is not None
         if with_end and span.end is not None:
-            parts.append(f"{span.word}@{span.start:.2f}-{span.end:.2f}")
+            item = f"{span.word}@{span.start:.2f}-{span.end:.2f}"
         else:
-            parts.append(f"{span.word}@{span.start:.2f}")
+            item = f"{span.word}@{span.start:.2f}"
+        if has_confidence:
+            item = f"{item}:{span.confidence:.3f}"
+        parts.append(item)
     return sep.join(parts)
+
+
+def _word_span_to_dict(*, span: WordSpan, include_confidence: bool) -> Dict[str, Any]:
+    ans: Dict[str, Any] = {"word": span.word, "start": span.start, "end": span.end}
+    if include_confidence and span.confidence is not None:
+        ans["confidence"] = span.confidence
+    return ans
 
 
 def _infer_bpe_model(args_bpe: Optional[str], cfg: Dict[str, Any], ckpts: List[str]) -> str:
@@ -661,6 +695,14 @@ def get_parser() -> argparse.ArgumentParser:
         "--with-end",
         action="store_true",
         help="Print word end times (requires CTC token durations).",
+    )
+    parser.add_argument(
+        "--with-confidence",
+        action="store_true",
+        help=(
+            "Print word confidence. For CTC, derived from torchaudio merge_tokens scores; "
+            "for RNNT, derived from joiner emission probability at the aligned frame."
+        ),
     )
     parser.add_argument(
         "--output-json",
@@ -927,6 +969,7 @@ def main() -> None:
                 tokens=align.tokens,
                 token_start_times=align.token_start_times,
                 token_durations=align.token_durations,
+                token_scores=align.token_scores if args.with_confidence else None,
             )
 
             per_model.append(
@@ -937,7 +980,10 @@ def main() -> None:
                     "streaming_chunk_size": spec.streaming_chunk_size,
                     "streaming_left_context_frames": spec.streaming_left_context_frames,
                     "tail_pad_frames": spec.tail_pad_frames if spec.causal else None,
-                    "words": [asdict(span) for span in spans],
+                    "words": [
+                        _word_span_to_dict(span=span, include_confidence=args.with_confidence)
+                        for span in spans
+                    ],
                 }
             )
 
@@ -946,6 +992,7 @@ def main() -> None:
                     model_name=spec.name,
                     spans=spans,
                     with_end=bool(args.with_end),
+                    with_confidence=bool(args.with_confidence),
                     sep=args.sep,
                 )
             )

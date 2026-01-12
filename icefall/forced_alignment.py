@@ -17,7 +17,9 @@ class ForcedAlignmentResult:
 
     Notes:
       - Times are in seconds, at feature-frame resolution after subsampling.
-      - token_durations/token_scores are available only for CTC forced alignment.
+      - token_durations are available only for CTC forced alignment.
+      - token_scores are available for CTC (token-span score from torchaudio
+        merge_tokens) and RNNT (emission probability at the aligned frame).
       - word_start_times are derived from SentencePiece word-boundary markers.
     """
 
@@ -249,7 +251,13 @@ def _force_align_ctc(
             blank=blank_id,
         )
 
-        token_spans = merge_tokens(labels[0], aligned_log_probs[0].exp())
+        try:
+            token_spans = merge_tokens(
+                labels[0], aligned_log_probs[0].exp(), blank=blank_id
+            )
+        except TypeError:
+            # For older torchaudio versions where merge_tokens does not accept `blank`.
+            token_spans = merge_tokens(labels[0], aligned_log_probs[0].exp())
 
         tokens = [sp.id_to_piece(s.token) for s in token_spans]
         token_start_times = [round(s.start * time_step, ndigits=3) for s in token_spans]
@@ -332,7 +340,7 @@ def _force_align_rnnt_max1(
                 f"len(tokens)={len(token_ids)} and T={T}."
             )
 
-        token_start_frames = _rnnt_viterbi_align_max1(
+        token_start_frames, token_scores = _rnnt_viterbi_align_max1(
             decoder=decoder,
             joiner=joiner,
             encoder_out=encoder_out[i, :T],
@@ -368,6 +376,7 @@ def _force_align_rnnt_max1(
                 kind="rnnt",
                 tokens=tokens,
                 token_start_times=token_start_times,
+                token_scores=token_scores,
                 words=words,
                 word_start_times=word_start_times,
             )
@@ -384,7 +393,7 @@ def _rnnt_viterbi_align_max1(
     encoder_out: torch.Tensor,
     token_ids: List[int],
     blank_id: int,
-) -> List[int]:
+) -> Tuple[List[int], List[float]]:
     """Viterbi forced alignment for a pruned RNNT-style joiner (max-1-symbol-per-frame).
 
     This assumes:
@@ -398,7 +407,7 @@ def _rnnt_viterbi_align_max1(
     T = encoder_out.size(0)
     U = len(token_ids)
     if U == 0:
-        return []
+        return [], []
 
     # Precompute joiner projections.
     enc_proj = joiner.encoder_proj(encoder_out)  # (T, joiner_dim)
@@ -468,4 +477,15 @@ def _rnnt_viterbi_align_max1(
             "RNNT forced alignment backtrace failed: did not align all tokens."
         )
 
-    return token_frames
+    # Token-level confidence: joiner emission probability of each reference token
+    # at its aligned frame (under the max-1-symbol-per-frame constraint).
+    frame_index = torch.tensor(token_frames, device=device, dtype=torch.long)  # (U,)
+    enc_sel = enc_proj.index_select(0, frame_index)  # (U, joiner_dim)
+    dec_sel = dec_proj[:U]  # (U, joiner_dim)
+    logits = joiner.output_linear(torch.tanh(enc_sel + dec_sel))  # (U, vocab)
+    log_probs = logits.log_softmax(dim=-1)
+    token_scores = (
+        log_probs.gather(1, token_ids_t.unsqueeze(1)).squeeze(1).exp().tolist()
+    )
+
+    return token_frames, token_scores

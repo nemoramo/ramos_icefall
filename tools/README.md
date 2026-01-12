@@ -2,7 +2,19 @@
 
 ## `force_align.py`: 强制对齐（Forced Alignment）
 
-给定一条音频 + 参考文本（reference transcript），输出**每个词**在音频中的对齐时间（默认输出 start；`--with-end` 可输出 start-end）。
+给定一条音频 + 参考文本（reference transcript），输出**每个词**在音频中的对齐时间（默认输出 start；`--with-end` 可输出 start-end；`--with-confidence` 可输出置信度）。
+
+当启用 `--with-confidence` 时，输出格式为：
+
+- `word@start-end:conf`（启用 `--with-end`）
+- `word@start:conf`（未启用 `--with-end` 或当前对齐方式不提供 end）
+
+其中 `conf` 为词级置信度（范围通常在 0~1）：
+
+- **CTC**：来自 `torchaudio.functional.merge_tokens()` 的 token-span score，再把一个词内的 tokens 做（按 duration 加权的）平均。
+- **RNNT**：在对齐到的帧上，joiner 对“参考 token”的 `softmax` 概率；词级为词内 tokens 的平均。
+
+注意：RNNT 的置信度只是一个“参考分数”，并不是严格意义上的 posterior；同时 RNNT 对齐实现仍假设 **max-1-symbol-per-frame**（如果模型常在同一帧输出多个符号，置信度会更不可靠）。
 
 这个工具支持**同时输入多个 `.pt` checkpoint**，并按 checkpoint 自动切换 forward 方式：
 
@@ -65,7 +77,8 @@ python3 tools/force_align.py \
   --bpe-model /path/to/bpe.model \
   --manifest /path/to/manifest.jsonl \
   --utt-id 0 \
-  --with-end
+  --with-end \
+  --with-confidence
 ```
 
 输出示例（同一个 utt_id 下，每个 checkpoint 一行）：
@@ -75,6 +88,13 @@ utt_id=0 unk=0 audio=/data1/.../12.wav
 text=daniel how do we think ...
 stream150 DANIEL@0.00-1.08 HOW@1.28-1.36 ...
 offline_ep4 DANIEL@0.00-0.92 HOW@1.04-1.12 ...
+```
+
+启用 `--with-confidence` 后，格式变为：
+
+```text
+stream150 DANIEL@0.00-1.08:0.97 HOW@1.28-1.36:0.91 ...
+offline_ep4 DANIEL@0.00-0.92:0.95 HOW@1.04-1.12:0.89 ...
 ```
 
 #### 2) wav.scp + text（Kaldi）
