@@ -6,13 +6,18 @@
 
 当启用 `--with-confidence` 时，输出格式为：
 
-- `word@start-end:conf`（启用 `--with-end`）
-- `word@start:conf`（未启用 `--with-end` 或当前对齐方式不提供 end）
+每个 checkpoint 一行，行首会追加句级置信度：
 
-其中 `conf` 为词级置信度（范围通常在 0~1）：
+- `<model_name> sent_conf=0.XXX word@start-end:conf ...`（启用 `--with-end`）
+- `<model_name> sent_conf=0.XXX word@start:conf ...`（未启用 `--with-end` 或当前对齐方式不提供 end）
+
+其中 `conf` 为词级置信度（范围通常在 0~1），`sent_conf` 为句级置信度：
 
 - **CTC**：来自 `torchaudio.functional.merge_tokens()` 的 token-span score，再把一个词内的 tokens 做（按 duration 加权的）平均。
 - **RNNT**：在对齐到的帧上，joiner 对“参考 token”的 `softmax` 概率；词级为词内 tokens 的平均。
+- **Sentence-level**：把全句 tokens 的分数做平均（CTC 按 duration 加权；RNNT 视作等权），并跳过纯分词边界 token `▁`。
+
+如果同时启用 `--output-json`，在 `--with-confidence` 下每个 `per_model` 会包含 `sentence_confidence`，每个词会包含 `confidence` 字段。
 
 注意：RNNT 的置信度只是一个“参考分数”，并不是严格意义上的 posterior；同时 RNNT 对齐实现仍假设 **max-1-symbol-per-frame**（如果模型常在同一帧输出多个符号，置信度会更不可靠）。
 
@@ -93,8 +98,8 @@ offline_ep4 DANIEL@0.00-0.92 HOW@1.04-1.12 ...
 启用 `--with-confidence` 后，格式变为：
 
 ```text
-stream150 DANIEL@0.00-1.08:0.97 HOW@1.28-1.36:0.91 ...
-offline_ep4 DANIEL@0.00-0.92:0.95 HOW@1.04-1.12:0.89 ...
+stream150 sent_conf=0.93 DANIEL@0.00-1.08:0.97 HOW@1.28-1.36:0.91 ...
+offline_ep4 sent_conf=0.91 DANIEL@0.00-0.92:0.95 HOW@1.04-1.12:0.89 ...
 ```
 
 #### 2) wav.scp + text（Kaldi）

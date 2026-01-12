@@ -533,15 +533,52 @@ def _tokens_to_word_spans(
     return out
 
 
+def _sentence_confidence_from_tokens(
+    *,
+    tokens: List[str],
+    token_durations: Optional[List[float]],
+    token_scores: Optional[List[float]],
+) -> Optional[float]:
+    if not tokens:
+        return None
+    if token_scores is None or len(token_scores) == 0:
+        return None
+    if len(tokens) != len(token_scores):
+        raise ValueError("tokens/token_scores length mismatch")
+    if token_durations is not None and len(tokens) != len(token_durations):
+        raise ValueError("tokens/token_durations length mismatch")
+
+    score_sum = 0.0
+    score_weight_sum = 0.0
+    for token_index, token in enumerate(tokens):
+        if token == "▁":
+            continue
+
+        score = float(token_scores[token_index])
+        dur = (
+            float(token_durations[token_index]) if token_durations is not None else None
+        )
+        weight = dur if dur is not None and dur > 0 else 1.0
+        score_sum += score * weight
+        score_weight_sum += weight
+
+    if score_weight_sum == 0:
+        return None
+    return float(score_sum / score_weight_sum)
+
+
 def _render_word_line(
     *,
     model_name: str,
+    sentence_confidence: Optional[float],
     spans: List[WordSpan],
     with_end: bool,
     with_confidence: bool,
     sep: str,
 ) -> str:
     parts: List[str] = [model_name]
+    if sentence_confidence is not None:
+        parts.append(f"sent_conf={sentence_confidence:.3f}")
     for span in spans:
         has_confidence = with_confidence and span.confidence is not None
         if with_end and span.end is not None:
@@ -700,8 +737,9 @@ def get_parser() -> argparse.ArgumentParser:
         "--with-confidence",
         action="store_true",
         help=(
-            "Print word confidence. For CTC, derived from torchaudio merge_tokens scores; "
-            "for RNNT, derived from joiner emission probability at the aligned frame."
+            "Print confidence. For CTC, derived from torchaudio merge_tokens scores; "
+            "for RNNT, derived from joiner emission probability at the aligned frame. "
+            "Also prints sentence-level confidence as sent_conf=..."
         ),
     )
     parser.add_argument(
@@ -972,24 +1010,36 @@ def main() -> None:
                 token_scores=align.token_scores if args.with_confidence else None,
             )
 
-            per_model.append(
-                {
-                    "name": spec.name,
-                    "ckpt": spec.ckpt,
-                    "causal": spec.causal,
-                    "streaming_chunk_size": spec.streaming_chunk_size,
-                    "streaming_left_context_frames": spec.streaming_left_context_frames,
-                    "tail_pad_frames": spec.tail_pad_frames if spec.causal else None,
-                    "words": [
-                        _word_span_to_dict(span=span, include_confidence=args.with_confidence)
-                        for span in spans
-                    ],
-                }
+            sentence_confidence = (
+                _sentence_confidence_from_tokens(
+                    tokens=align.tokens,
+                    token_durations=align.token_durations,
+                    token_scores=align.token_scores,
+                )
+                if args.with_confidence
+                else None
             )
+
+            per_model_item: Dict[str, Any] = {
+                "name": spec.name,
+                "ckpt": spec.ckpt,
+                "causal": spec.causal,
+                "streaming_chunk_size": spec.streaming_chunk_size,
+                "streaming_left_context_frames": spec.streaming_left_context_frames,
+                "tail_pad_frames": spec.tail_pad_frames if spec.causal else None,
+                "words": [
+                    _word_span_to_dict(span=span, include_confidence=args.with_confidence)
+                    for span in spans
+                ],
+            }
+            if args.with_confidence:
+                per_model_item["sentence_confidence"] = sentence_confidence
+            per_model.append(per_model_item)
 
             print(
                 _render_word_line(
                     model_name=spec.name,
+                    sentence_confidence=sentence_confidence if args.with_confidence else None,
                     spans=spans,
                     with_end=bool(args.with_end),
                     with_confidence=bool(args.with_confidence),
