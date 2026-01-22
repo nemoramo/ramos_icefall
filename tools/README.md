@@ -35,6 +35,8 @@
 
 兼容性说明：如果你指定了 `--align-kind ctc`（或使用默认值），但 checkpoint 是 **Transducer-only**（没有 CTC head），脚本会自动回退到 `rnnt` 并提示一条 warning。
 
+另外，一些导出的 `.pt` 可能只包含 `{"model": state_dict}`（不包含训练参数）。这种情况下脚本会尝试从 `state_dict` **反推 Zipformer2 结构参数**（例如 `encoder_dim/num_encoder_layers/feedforward_dim/...`）以便完成加载。
+
 ### 为什么必须区分 streaming/offline forward？
 
 Zipformer 的 “模拟流式”（attention mask + 随机 chunk）和 “真流式”（`streaming_forward()` + states）**不是同一条计算路径**。  

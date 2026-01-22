@@ -22,6 +22,7 @@ import importlib.util
 import json
 import math
 import random
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -274,7 +275,21 @@ def _argparse_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
             continue
         if action.default is argparse.SUPPRESS:
             continue
-        defaults[str(action.dest)] = action.default
+
+        value = action.default
+        action_type = getattr(action, "type", None)
+        if action_type is not None and value is not None:
+            try:
+                if isinstance(value, str):
+                    value = action_type(value)
+                elif isinstance(value, list):
+                    value = [
+                        (action_type(v) if isinstance(v, str) else v) for v in value
+                    ]
+            except Exception:
+                pass
+
+        defaults[str(action.dest)] = value
     return defaults
 
 
@@ -317,6 +332,176 @@ def _maybe_get_recipe_default_params(
     return params
 
 
+def _infer_zipformer2_params_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """
+    Best-effort inference of Zipformer2 model args from a state_dict.
+
+    This helps with exported checkpoints that only contain weights (e.g. {"model": ...})
+    and therefore lack training hyperparameters like encoder_dim/num_encoder_layers.
+    """
+
+    def get_shape(key: str) -> Optional[Tuple[int, ...]]:
+        value = state_dict.get(key)
+        if not isinstance(value, torch.Tensor):
+            return None
+        return tuple(value.shape)
+
+    encoder_ids: List[int] = []
+    for k in state_dict.keys():
+        m = re.match(r"^encoder\.encoders\.(\d+)\.", k)
+        if m:
+            encoder_ids.append(int(m.group(1)))
+    if not encoder_ids:
+        return {}
+
+    encoder_ids_sorted = sorted(set(encoder_ids))
+    num_encoders = len(encoder_ids_sorted)
+    if encoder_ids_sorted != list(range(num_encoders)):
+        return {}
+
+    max_layer_by_encoder: Dict[int, int] = {i: -1 for i in encoder_ids_sorted}
+    for k in state_dict.keys():
+        m = re.match(r"^encoder\.encoders\.(\d+)\.(?:encoder\.)?layers\.(\d+)\.", k)
+        if not m:
+            continue
+        enc = int(m.group(1))
+        layer = int(m.group(2))
+        if enc in max_layer_by_encoder and layer > max_layer_by_encoder[enc]:
+            max_layer_by_encoder[enc] = layer
+
+    num_encoder_layers: List[int] = []
+    for i in encoder_ids_sorted:
+        max_layer = max_layer_by_encoder.get(i, -1)
+        if max_layer < 0:
+            return {}
+        num_encoder_layers.append(max_layer + 1)
+
+    encoder_dim: List[int] = []
+    feedforward_dim: List[int] = []
+    cnn_module_kernel: List[int] = []
+    downsampling_factor: List[int] = []
+
+    linear_pos_pos_dim: Optional[int] = None
+    in_proj_dim_list: List[int] = []
+    self_attn1_proj_dim_list: List[int] = []
+    linear_pos_out_dim_list: List[int] = []
+
+    for i in encoder_ids_sorted:
+        prefix = f"encoder.encoders.{i}"
+        layer0_prefix = f"{prefix}.layers.0"
+        if get_shape(f"{layer0_prefix}.norm.bias") is None:
+            layer0_prefix = f"{prefix}.encoder.layers.0"
+            if get_shape(f"{layer0_prefix}.norm.bias") is None:
+                return {}
+
+        # encoder_dim from layer norm bias (embed_dim,)
+        norm_shape = get_shape(f"{layer0_prefix}.norm.bias")
+        assert norm_shape is not None
+        encoder_dim.append(int(norm_shape[0]))
+
+        # feedforward_dim from feed_forward2.in_proj.weight (ff_dim, embed_dim)
+        ff2_shape = get_shape(f"{layer0_prefix}.feed_forward2.in_proj.weight")
+        if ff2_shape is None:
+            return {}
+        feedforward_dim.append(int(ff2_shape[0]))
+
+        # cnn_module_kernel from depthwise conv kernel (embed_dim, 1, kernel)
+        conv_shape = get_shape(f"{layer0_prefix}.conv_module1.depthwise_conv.weight")
+        if conv_shape is None or len(conv_shape) != 3:
+            return {}
+        cnn_module_kernel.append(int(conv_shape[2]))
+
+        # downsampling_factor from SimpleDownsample bias length, else 1
+        ds_shape = get_shape(f"{prefix}.downsample.bias")
+        downsampling_factor.append(int(ds_shape[0]) if ds_shape is not None else 1)
+
+        # attention-related shapes (optional)
+        w_in = get_shape(f"{layer0_prefix}.self_attn_weights.in_proj.weight")
+        w_sa1 = get_shape(f"{layer0_prefix}.self_attn1.in_proj.weight")
+        w_lp = get_shape(f"{layer0_prefix}.self_attn_weights.linear_pos.weight")
+        if w_in and w_sa1 and w_lp:
+            in_proj_dim_list.append(int(w_in[0]))
+            self_attn1_proj_dim_list.append(int(w_sa1[0]))
+            linear_pos_out_dim_list.append(int(w_lp[0]))
+            linear_pos_pos_dim = int(w_lp[1])
+
+    inferred: Dict[str, Any] = {
+        "num_encoder_layers": ",".join(map(str, num_encoder_layers)),
+        "encoder_dim": ",".join(map(str, encoder_dim)),
+        "feedforward_dim": ",".join(map(str, feedforward_dim)),
+        "cnn_module_kernel": ",".join(map(str, cnn_module_kernel)),
+        "downsampling_factor": ",".join(map(str, downsampling_factor)),
+    }
+
+    # pos_dim affects weight shapes; infer if possible.
+    if linear_pos_pos_dim is not None:
+        inferred["pos_dim"] = int(linear_pos_pos_dim)
+
+    # Infer attention head dims if shapes look consistent across encoders.
+    if (
+        len(in_proj_dim_list) == num_encoders
+        and len(self_attn1_proj_dim_list) == num_encoders
+        and len(linear_pos_out_dim_list) == num_encoders
+    ):
+        ratios_b_c = []
+        ratios_a_c = []
+        for b, a, c in zip(in_proj_dim_list, self_attn1_proj_dim_list, linear_pos_out_dim_list):
+            if c <= 0 or b % c != 0 or a % c != 0:
+                ratios_b_c = []
+                break
+            ratios_b_c.append(b // c)
+            ratios_a_c.append(a // c)
+        if ratios_b_c and len(set(ratios_b_c)) == 1 and len(set(ratios_a_c)) == 1:
+            ratio_b_c = int(ratios_b_c[0])
+            ratio_a_c = int(ratios_a_c[0])
+            if ratio_b_c > 1 and ratio_b_c % 2 == 1:
+                k = (ratio_b_c - 1) // 2  # query_head_dim / pos_head_dim
+
+                # pos_head_dim must divide all (num_heads * pos_head_dim)
+                from math import gcd
+
+                gcd_c = 0
+                for c in linear_pos_out_dim_list:
+                    gcd_c = gcd(gcd_c, int(c))
+
+                # Try pos_head_dim divisors and pick the best-scoring one.
+                candidates: List[Tuple[int, int, int]] = []  # (score, pos_head_dim, qhd)
+                for p in range(1, gcd_c + 1):
+                    if gcd_c % p != 0:
+                        continue
+                    qhd = k * p
+                    vhd = ratio_a_c * p
+                    # Heuristics: prefer common settings.
+                    if not (2 <= p <= 16 and 8 <= vhd <= 64 and 8 <= qhd <= 128):
+                        continue
+                    score = abs(p - 4) + abs(qhd - 32) + abs(vhd - 12)
+                    candidates.append((score, p, qhd))
+
+                if candidates:
+                    candidates.sort()
+                    pos_head_dim = int(candidates[0][1])
+                    query_head_dim = int(candidates[0][2])
+                    value_head_dim = int(ratio_a_c * pos_head_dim)
+
+                    num_heads = [c // pos_head_dim for c in linear_pos_out_dim_list]
+                    inferred["num_heads"] = ",".join(map(str, num_heads))
+                    inferred["pos_head_dim"] = str(pos_head_dim)
+                    inferred["query_head_dim"] = str(query_head_dim)
+                    inferred["value_head_dim"] = str(value_head_dim)
+
+    # Decoder/joiner dims and vocab size can also be inferred reliably.
+    dec_shape = get_shape("decoder.embedding.weight")
+    if dec_shape is not None and len(dec_shape) == 2:
+        inferred["vocab_size"] = int(dec_shape[0])
+        inferred["decoder_dim"] = int(dec_shape[1])
+    joiner_shape = get_shape("joiner.output_linear.weight")
+    if joiner_shape is not None and len(joiner_shape) == 2:
+        inferred["vocab_size"] = int(joiner_shape[0])
+        inferred["joiner_dim"] = int(joiner_shape[1])
+
+    return inferred
+
+
 def _load_model_from_ckpt(
     *,
     ckpt_path: str,
@@ -337,10 +522,17 @@ def _load_model_from_ckpt(
         "sampler",
     }
     params_dict: Dict[str, Any] = dict(default_params) if default_params else {}
+    has_metadata = False
     for key, value in ckpt.items():
         if key in skip:
             continue
+        has_metadata = True
         params_dict[key] = value
+
+    if not has_metadata and isinstance(ckpt.get("model"), dict):
+        inferred = _infer_zipformer2_params_from_state_dict(ckpt["model"])
+        if inferred:
+            params_dict.update(inferred)
     if override_chunk_size is not None:
         params_dict["chunk_size"] = str(int(override_chunk_size))
     if override_left_context_frames is not None:
