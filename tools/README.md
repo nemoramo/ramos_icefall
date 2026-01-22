@@ -33,6 +33,8 @@
 - `--align-kind rnnt`：使用 Transducer/RNNT 头强制对齐；当前实现只提供 token start time（没有 duration），因此 `--with-end` 只会显示 start
 - `--align-kind auto`：如果模型包含 RNNT 头则优先用 `rnnt`，否则回退到 `ctc`
 
+兼容性说明：如果你指定了 `--align-kind ctc`（或使用默认值），但 checkpoint 是 **Transducer-only**（没有 CTC head），脚本会自动回退到 `rnnt` 并提示一条 warning。
+
 ### 为什么必须区分 streaming/offline forward？
 
 Zipformer 的 “模拟流式”（attention mask + 随机 chunk）和 “真流式”（`streaming_forward()` + states）**不是同一条计算路径**。  

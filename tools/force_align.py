@@ -238,6 +238,11 @@ def _select_utts(
 
 
 def _load_get_model(recipe_dir: Path) -> Callable[[AttributeDict], nn.Module]:
+    module = _load_recipe_train_module(recipe_dir)
+    return module.get_model
+
+
+def _load_recipe_train_module(recipe_dir: Path):
     recipe_dir = recipe_dir.resolve()
     train_py = recipe_dir / "train.py"
     if not train_py.is_file():
@@ -255,10 +260,61 @@ def _load_get_model(recipe_dir: Path) -> Callable[[AttributeDict], nn.Module]:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
 
-    get_model = getattr(module, "get_model", None)
-    if get_model is None:
+    if getattr(module, "get_model", None) is None:
         raise AttributeError(f"{train_py} does not define get_model(params)")
-    return get_model
+    return module
+
+
+def _argparse_defaults(parser: argparse.ArgumentParser) -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {}
+    for action in getattr(parser, "_actions", []):
+        if getattr(action, "dest", None) in (None, "help"):
+            continue
+        if not hasattr(action, "default"):
+            continue
+        if action.default is argparse.SUPPRESS:
+            continue
+        defaults[str(action.dest)] = action.default
+    return defaults
+
+
+def _maybe_get_recipe_default_params(
+    recipe_module, *, sp: spm.SentencePieceProcessor
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+
+    get_params = getattr(recipe_module, "get_params", None)
+    if callable(get_params):
+        try:
+            recipe_params = get_params()
+            if isinstance(recipe_params, dict):
+                params.update(recipe_params)
+        except Exception:
+            pass
+
+    get_train_parser = getattr(recipe_module, "get_parser", None)
+    if callable(get_train_parser):
+        try:
+            parser = get_train_parser()
+            if isinstance(parser, argparse.ArgumentParser):
+                params.update(_argparse_defaults(parser))
+        except Exception:
+            pass
+
+    # Common recipe keys; best-effort defaults for exported checkpoints that only
+    # contain `model` weights.
+    try:
+        params.setdefault("vocab_size", int(sp.get_piece_size()))
+    except Exception:
+        pass
+    try:
+        sp_blank_id = int(sp.piece_to_id("<blk>"))
+        if sp_blank_id >= 0 and sp.id_to_piece(sp_blank_id) == "<blk>":
+            params.setdefault("blank_id", sp_blank_id)
+    except Exception:
+        pass
+
+    return params
 
 
 def _load_model_from_ckpt(
@@ -266,6 +322,7 @@ def _load_model_from_ckpt(
     ckpt_path: str,
     device: torch.device,
     get_model: Callable[[AttributeDict], nn.Module],
+    default_params: Optional[Dict[str, Any]] = None,
     override_chunk_size: Optional[int] = None,
     override_left_context_frames: Optional[int] = None,
 ) -> Tuple[nn.Module, Dict[str, Any], Dict[str, Any]]:
@@ -279,7 +336,7 @@ def _load_model_from_ckpt(
         "grad_scaler",
         "sampler",
     }
-    params_dict: Dict[str, Any] = {}
+    params_dict: Dict[str, Any] = dict(default_params) if default_params else {}
     for key, value in ckpt.items():
         if key in skip:
             continue
@@ -808,7 +865,9 @@ def main() -> None:
 
     selected = _select_utts(utts, utt_id=args.utt_id, num_utts=args.num_utts, seed=args.seed)
 
-    get_model = _load_get_model(recipe_dir)
+    recipe_module = _load_recipe_train_module(recipe_dir)
+    get_model = recipe_module.get_model
+    recipe_default_params = _maybe_get_recipe_default_params(recipe_module, sp=sp)
 
     # Build models and decide forward mode per ckpt.
     model_specs: List[ModelSpec] = []
@@ -827,16 +886,27 @@ def main() -> None:
 
     for ckpt_path, model_name in zip(ckpts, names):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        causal = bool(ckpt.get("causal", False))
-        subsampling_factor = int(ckpt.get("subsampling_factor", 4))
-        feature_dim = int(ckpt.get("feature_dim", 80))
+        causal = bool(ckpt.get("causal", recipe_default_params.get("causal", False)))
+        subsampling_factor = int(
+            ckpt.get(
+                "subsampling_factor", recipe_default_params.get("subsampling_factor", 4)
+            )
+        )
+        feature_dim = int(ckpt.get("feature_dim", recipe_default_params.get("feature_dim", 80)))
 
         chosen_chunk: Optional[int] = None
         chosen_lcf: Optional[int] = None
 
         if causal:
-            ckpt_chunk_list = _parse_int_list(str(ckpt.get("chunk_size", "")))
-            ckpt_lcf_list = _parse_int_list(str(ckpt.get("left_context_frames", "")))
+            chunk_src = ckpt.get("chunk_size", None)
+            if chunk_src is None:
+                chunk_src = recipe_default_params.get("chunk_size", "")
+            lcf_src = ckpt.get("left_context_frames", None)
+            if lcf_src is None:
+                lcf_src = recipe_default_params.get("left_context_frames", "")
+
+            ckpt_chunk_list = _parse_int_list(str(chunk_src or ""))
+            ckpt_lcf_list = _parse_int_list(str(lcf_src or ""))
             ckpt_chunk_pos = {value for value in ckpt_chunk_list if value > 0}
             ckpt_lcf_pos = {value for value in ckpt_lcf_list if value > 0}
             if override_chunk is not None:
@@ -870,6 +940,7 @@ def main() -> None:
                 ckpt_path=ckpt_path,
                 device=device,
                 get_model=get_model,
+                default_params=recipe_default_params,
                 override_chunk_size=chosen_chunk,
                 override_left_context_frames=chosen_lcf,
             )
@@ -878,6 +949,7 @@ def main() -> None:
                 ckpt_path=ckpt_path,
                 device=device,
                 get_model=get_model,
+                default_params=recipe_default_params,
             )
 
         if causal:
@@ -991,13 +1063,27 @@ def main() -> None:
             else:
                 enc, enc_lens = _compute_offline_encoder_out(model, feats)
 
+            align_kind = args.align_kind
+            if align_kind == "ctc" and not hasattr(model, "ctc_output"):
+                # Support Transducer-only checkpoints: fall back to RNNT if possible.
+                if getattr(model, "use_transducer", False) or (
+                    hasattr(model, "decoder") and hasattr(model, "joiner")
+                ):
+                    print(
+                        f"[force_align] {spec.name}: model has no CTC head; "
+                        "falling back to RNNT alignment. "
+                        "Tip: use --align-kind rnnt/auto to suppress this warning.",
+                        file=sys.stderr,
+                    )
+                    align_kind = "rnnt"
+
             align = force_align(
                 model=model,
                 encoder_out=enc,
                 encoder_out_lens=enc_lens,
                 texts=[text_used],
                 sp=sp,
-                kind=args.align_kind,
+                kind=align_kind,
                 subsampling_factor=spec.subsampling_factor,
                 frame_shift_ms=10.0,
             )[0]
@@ -1023,6 +1109,7 @@ def main() -> None:
             per_model_item: Dict[str, Any] = {
                 "name": spec.name,
                 "ckpt": spec.ckpt,
+                "align_kind": align.kind,
                 "causal": spec.causal,
                 "streaming_chunk_size": spec.streaming_chunk_size,
                 "streaming_left_context_frames": spec.streaming_left_context_frames,
