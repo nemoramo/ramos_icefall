@@ -243,6 +243,24 @@ class MSR_AsrDataModule:
             default=2,
             help="Validation dataloader workers.",
         )
+        group.add_argument(
+            "--prefetch-factor",
+            type=int,
+            default=4,
+            help="Prefetch factor for train dataloader when --num-workers > 0.",
+        )
+        group.add_argument(
+            "--valid-prefetch-factor",
+            type=int,
+            default=2,
+            help="Prefetch factor for valid dataloader when --valid-num-workers > 0.",
+        )
+        group.add_argument(
+            "--test-prefetch-factor",
+            type=int,
+            default=2,
+            help="Prefetch factor for test dataloader when --num-workers > 0.",
+        )
 
     def train_dataloaders(
         self,
@@ -380,7 +398,7 @@ class MSR_AsrDataModule:
         train_dl_kwargs = {}
         if self.args.num_workers > 0:
             train_dl_kwargs["persistent_workers"] = True
-            train_dl_kwargs["prefetch_factor"] = 4
+            train_dl_kwargs["prefetch_factor"] = self.args.prefetch_factor
 
         train_dl = DataLoader(
             train,
@@ -424,7 +442,7 @@ class MSR_AsrDataModule:
         valid_dl_kwargs = {}
         if self.args.valid_num_workers > 0:
             valid_dl_kwargs["persistent_workers"] = True
-            valid_dl_kwargs["prefetch_factor"] = 2
+            valid_dl_kwargs["prefetch_factor"] = self.args.valid_prefetch_factor
 
         valid_dl = DataLoader(
             validate,
@@ -454,7 +472,7 @@ class MSR_AsrDataModule:
         test_dl_kwargs = {}
         if self.args.num_workers > 0:
             test_dl_kwargs["persistent_workers"] = True
-            test_dl_kwargs["prefetch_factor"] = 2
+            test_dl_kwargs["prefetch_factor"] = self.args.test_prefetch_factor
 
         test_dl = DataLoader(
             test,
