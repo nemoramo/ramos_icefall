@@ -55,6 +55,7 @@ import argparse
 import copy
 import logging
 import os
+import time
 import warnings
 from pathlib import Path
 from shutil import copyfile
@@ -1147,6 +1148,7 @@ def compute_validation_loss(
             text = text.lower()
         return " ".join(text.split())
 
+    valid_start = time.perf_counter()
     with torch.no_grad():
         for batch_idx, batch in enumerate(valid_dl):
             loss, loss_info = compute_loss(
@@ -1198,6 +1200,15 @@ def compute_validation_loss(
             tot_ins += ins
             tot_del += dels
             tot_sub += subs
+
+    valid_time = time.perf_counter() - valid_start
+    logging.info(
+        "Validation performance: valid_time=%.3fs, batches=%s, "
+        "avg_batch_time=%.3fs",
+        valid_time,
+        batch_idx + 1 if "batch_idx" in locals() else 0,
+        valid_time / (batch_idx + 1) if "batch_idx" in locals() else 0.0,
+    )
 
     if world_size > 1:
         tot_loss.reduce(device)
@@ -1294,7 +1305,13 @@ def train_one_epoch(
             rank=0,
         )
 
+    prev_step_end = time.perf_counter()
+
     for batch_idx, batch in enumerate(train_dl):
+        iter_start = time.perf_counter()
+        data_time = iter_start - prev_step_end
+        compute_start = time.perf_counter()
+
         if batch_idx % 10 == 0:
             set_batch_count(model, get_adjusted_batch_count(params))
 
@@ -1302,6 +1319,8 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
                     params=params,
@@ -1321,6 +1340,8 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         except Exception as e:
             err_msg = str(e)
             is_oom = "out of memory" in err_msg.lower()
@@ -1403,16 +1424,74 @@ def train_one_epoch(
         if batch_idx % params.log_interval == 0:
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
+            iter_end = time.perf_counter()
+            iter_time = iter_end - iter_start
+            compute_time = iter_end - compute_start
+            batch_audio_sec = 0.0
+            if batch["supervisions"]["num_frames"] is not None:
+                batch_audio_sec = (
+                    float(batch["supervisions"]["num_frames"].float().sum().item())
+                    / 100.0
+                )
+            batch_time_ms = iter_time * 1000.0
+            data_time_ms = data_time * 1000.0
+            compute_time_ms = compute_time * 1000.0
+            speed_utt = (
+                batch_size / max(iter_time, 1e-6) if batch_size > 0 else 0.0
+            )
+            speed_audio = (
+                batch_audio_sec / max(iter_time, 1e-6) if batch_audio_sec > 0 else 0.0
+            )
+            if torch.cuda.is_available():
+                gpu_mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                gpu_mem_reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            else:
+                gpu_mem_alloc_mb = 0.0
+                gpu_mem_reserved_mb = 0.0
 
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
                 f"tot_loss[{tot_loss}], batch size: {batch_size}, "
                 f"lr: {cur_lr:.2e}, "
+                f"perf: it={batch_time_ms:.1f}ms "
+                f"data={data_time_ms:.1f}ms "
+                f"compute={compute_time_ms:.1f}ms "
+                f"audio={batch_audio_sec:.1f}s "
+                f"utt/s={speed_utt:.1f} "
+                f"audio_s/s={speed_audio:.1f} "
+                f"gmem={gpu_mem_alloc_mb:.1f}/{gpu_mem_reserved_mb:.1f}MB, "
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
 
             if tb_writer is not None:
+                tb_writer.add_scalar(
+                    "train/iter_ms", batch_time_ms, params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    "train/data_ms", data_time_ms, params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    "train/compute_ms", compute_time_ms, params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    "train/utt_per_sec", speed_utt, params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    "train/audio_sec_per_sec",
+                    speed_audio,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/gpu_mem_alloc_mb",
+                    gpu_mem_alloc_mb,
+                    params.batch_idx_train,
+                )
+                tb_writer.add_scalar(
+                    "train/gpu_mem_reserved_mb",
+                    gpu_mem_reserved_mb,
+                    params.batch_idx_train,
+                )
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
@@ -1426,6 +1505,7 @@ def train_one_epoch(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
                     )
 
+        prev_step_end = time.perf_counter()
         if (
             params.batch_idx_train > 0
             and params.batch_idx_train % params.valid_interval == 0
