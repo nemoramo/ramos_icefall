@@ -562,6 +562,12 @@ def get_parser():
         default=0,
         help="If > 0, compute validation WER using at most this many valid batches.",
     )
+    parser.add_argument(
+        "--wer-lowercase",
+        type=str2bool,
+        default=True,
+        help="Lowercase hypotheses and references before WER.",
+    )
 
     parser.add_argument(
         "--inf-check",
@@ -679,6 +685,7 @@ def get_params() -> AttributeDict:
             "warm_step": 2000,
             "compute_valid_wer": False,
             "valid_wer_max_batches": 0,
+            "wer_lowercase": True,
             "env_info": get_env_info(),
         }
     )
@@ -1132,6 +1139,14 @@ def compute_validation_loss(
         errs = ins + dels + subs
         return errs, ref_len, ins, dels, subs
 
+    def _normalize_wer_text(text: str) -> str:
+        if text is None:
+            return ""
+        text = text.strip()
+        if params.wer_lowercase:
+            text = text.lower()
+        return " ".join(text.split())
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(valid_dl):
             loss, loss_info = compute_loss(
@@ -1170,8 +1185,11 @@ def compute_validation_loss(
                     blank_id=params.blank_id,
                 )
 
-            hyp_texts = sp.decode(hyp_tokens)
-            ref_words = [text.split() for text in batch["supervisions"]["text"]]
+            hyp_texts = [_normalize_wer_text(text) for text in sp.decode(hyp_tokens)]
+            ref_words = [
+                _normalize_wer_text(text).split()
+                for text in batch["supervisions"]["text"]
+            ]
             hyp_words = [text.split() for text in hyp_texts]
 
             errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_words, hyp_words)

@@ -4,18 +4,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ICEFALL_ROOT="${ICEFALL_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+DATA_ROOT="${DATA_ROOT:-/data1/${USER}}"
 
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 export PYTHONPATH="${ICEFALL_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export TMPDIR="${TMPDIR:-${SCRIPT_DIR}/.tmp}"
+export TMPDIR="${TMPDIR:-${DATA_ROOT}/tmp}"
 # NCCL defaults for single-node run without IB.
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 mkdir -p "${TMPDIR}"
 
-MANIFEST_DIR="${MANIFEST_DIR:-${SCRIPT_DIR}/data/manifests/french}"
+MANIFEST_DIR="${MANIFEST_DIR:-${DATA_ROOT}/data/french/manifests}"
 TRAIN_CUTS_FILENAME="${TRAIN_CUTS_FILENAME:-msr_cuts_French_train.jsonl.gz}"
 VALID_CUTS_FILENAME="${VALID_CUTS_FILENAME:-msr_cuts_French_valid.jsonl.gz}"
 TEST_CUTS_FILENAME="${TEST_CUTS_FILENAME:-msr_cuts_French_test.jsonl.gz}"
@@ -37,7 +38,7 @@ fi
 WORLD_SIZE="${WORLD_SIZE:-8}"
 DIST_BACKEND="${DIST_BACKEND:-nccl}"
 MASTER_PORT="${MASTER_PORT:-12360}"
-EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/exp/zipformer_france_onfly}"
+EXP_DIR="${EXP_DIR:-${DATA_ROOT}/experiments/zipformer/$(date +%Y%m%d)_france_onfly}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${EXP_DIR}/tensorboard}"
 MAX_DURATION="${MAX_DURATION:-1000}"
 MAX_TRAIN_CUT_DURATION="${MAX_TRAIN_CUT_DURATION:-30}"
@@ -62,6 +63,7 @@ ENABLE_MUSAN="${ENABLE_MUSAN:-0}"
 COMPUTE_VALID_WER="${COMPUTE_VALID_WER:-1}"
 # Limit WER validation cost; 0 means full validation set.
 VALID_WER_MAX_BATCHES="${VALID_WER_MAX_BATCHES:-100}"
+WER_LOWERCASE="${WER_LOWERCASE:-1}"
 
 python ./zipformer/train.py \
   --world-size "${WORLD_SIZE}" \
@@ -89,6 +91,7 @@ python ./zipformer/train.py \
   --filter-cuts "${FILTER_CUTS}" \
   --compute-valid-wer "${COMPUTE_VALID_WER}" \
   --valid-wer-max-batches "${VALID_WER_MAX_BATCHES}" \
+  --wer-lowercase "${WER_LOWERCASE}" \
   --num-encoder-layers 2,2,4,5,4,2 \
   --feedforward-dim 512,768,1536,2048,1536,768 \
   --encoder-dim 192,256,512,768,512,256 \
