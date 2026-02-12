@@ -50,6 +50,8 @@ LOG_INTERVAL="${LOG_INTERVAL:-50}"
 BASE_LR="${BASE_LR:-0.045}"
 NUM_EPOCHS="${NUM_EPOCHS:-80}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20000}"
+START_EPOCH="${START_EPOCH:-1}"
+START_BATCH="${START_BATCH:-0}"
 
 # Usually disabled for online feature benchmarks to avoid extra startup overhead.
 SKIP_OOM_SCAN="${SKIP_OOM_SCAN:-1}"
@@ -71,7 +73,8 @@ python ./zipformer/train.py \
   --master-port "${MASTER_PORT}" \
   --exp-dir "${EXP_DIR}" \
   --tensorboard-dir "${TENSORBOARD_DIR}" \
-  --start-epoch 1 \
+  --start-epoch "${START_EPOCH}" \
+  --start-batch "${START_BATCH}" \
   --max-duration "${MAX_DURATION}" \
   --max-train-cut-duration "${MAX_TRAIN_CUT_DURATION}" \
   --num-buckets "${NUM_BUCKETS}" \
