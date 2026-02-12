@@ -123,6 +123,24 @@ class MSR_AsrDataModule:
             "(you might want to increase it for larger datasets).",
         )
         group.add_argument(
+            "--bucketing-buffer-size",
+            type=int,
+            default=2000,
+            help=(
+                "Number of cut indexes to store in one bucket sampler buffer. "
+                "Higher values increase mixing randomness but consume more memory."
+            ),
+        )
+        group.add_argument(
+            "--bucketing-shuffle-buffer-size",
+            type=int,
+            default=5000,
+            help=(
+                "Number of cut indexes to keep in the shuffle buffer for the "
+                "DynamicBucketingSampler."
+            ),
+        )
+        group.add_argument(
             "--concatenate-cuts",
             type=str2bool,
             default=False,
@@ -360,8 +378,8 @@ class MSR_AsrDataModule:
                 max_duration=self.args.max_duration,
                 shuffle=self.args.shuffle,
                 num_buckets=self.args.num_buckets,
-                buffer_size=self.args.num_buckets * 2000,
-                shuffle_buffer_size=self.args.num_buckets * 5000,
+                buffer_size=self.args.bucketing_buffer_size,
+                shuffle_buffer_size=self.args.bucketing_shuffle_buffer_size,
                 drop_last=self.args.drop_last,
             )
             if getattr(self.args, "world_size", 1) > 1:
