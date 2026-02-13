@@ -34,7 +34,13 @@ from lhotse.dataset.input_strategies import OnTheFlyFeatures
 
 # Make repo root importable (so `import icefall` works without external PYTHONPATH).
 _THIS_DIR = Path(__file__).resolve().parent
-_ICEFALL_ROOT = _THIS_DIR.parents[4]
+_ICEFALL_ROOT = None
+for _p in [_THIS_DIR] + list(_THIS_DIR.parents):
+    if (_p / "icefall").is_dir():
+        _ICEFALL_ROOT = _p
+        break
+if _ICEFALL_ROOT is None:
+    raise RuntimeError("Cannot locate repo root containing 'icefall/' directory.")
 sys.path.insert(0, str(_ICEFALL_ROOT))
 
 from icefall.utils import AttributeDict  # noqa: E402
