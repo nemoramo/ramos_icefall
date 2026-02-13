@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
+import sys
 from typing import List, Tuple
 
 import sentencepiece as spm
@@ -31,7 +32,12 @@ from lhotse import CutSet, Fbank, FbankConfig, load_manifest_lazy
 from lhotse.dataset import K2SpeechRecognitionDataset
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
 
-from icefall.utils import AttributeDict
+# Make repo root importable (so `import icefall` works without external PYTHONPATH).
+_THIS_DIR = Path(__file__).resolve().parent
+_ICEFALL_ROOT = _THIS_DIR.parents[4]
+sys.path.insert(0, str(_ICEFALL_ROOT))
+
+from icefall.utils import AttributeDict  # noqa: E402
 
 import train
 
@@ -166,4 +172,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
