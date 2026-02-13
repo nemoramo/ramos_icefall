@@ -971,7 +971,9 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss = model(
+        # Newer AsrModel returns (simple_loss, pruned_loss, ctc_loss,
+        # attention_decoder_loss, cr_loss). We don't use CR-CTC here, so ignore it.
+        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, _cr_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
