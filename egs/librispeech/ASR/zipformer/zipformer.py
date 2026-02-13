@@ -49,6 +49,14 @@ from torch import Tensor, nn
 
 from icefall.utils import torch_autocast
 
+try:
+    # PyTorch >= 2.5 (exact version depends on build) provides FlexAttention.
+    # We keep the import optional so older environments still work with the
+    # default (non-flex) attention implementation.
+    from torch.nn.attention import flex_attention as _flex_attention  # type: ignore
+except Exception:
+    _flex_attention = None
+
 
 class Zipformer2(EncoderInterface):
     """
@@ -118,6 +126,7 @@ class Zipformer2(EncoderInterface):
         causal: bool = False,
         chunk_size: Tuple[int] = [-1],
         left_context_frames: Tuple[int] = [-1],
+        use_flex_attention: bool = False,
     ) -> None:
         super(Zipformer2, self).__init__()
 
@@ -153,6 +162,7 @@ class Zipformer2(EncoderInterface):
         self.causal = causal
         self.chunk_size = chunk_size
         self.left_context_frames = left_context_frames
+        self.use_flex_attention = use_flex_attention
 
         for u, d in zip(encoder_unmasked_dim, encoder_dim):
             assert u <= d
@@ -173,6 +183,7 @@ class Zipformer2(EncoderInterface):
                 dropout=dropout,
                 cnn_module_kernel=cnn_module_kernel[i],
                 causal=causal,
+                use_flex_attention=use_flex_attention,
             )
 
             # For the segment of the warmup period, we let the Conv2dSubsampling
@@ -615,9 +626,11 @@ class Zipformer2EncoderLayer(nn.Module):
         bypass_skip_rate: FloatLike = ScheduledFloat(
             (0.0, 0.5), (4000.0, 0.02), default=0
         ),
+        use_flex_attention: bool = False,
     ) -> None:
         super(Zipformer2EncoderLayer, self).__init__()
         self.embed_dim = embed_dim
+        self.use_flex_attention = use_flex_attention
 
         # self.bypass implements layer skipping as well as bypass; see its default values.
         self.bypass = BypassModule(
@@ -797,13 +810,32 @@ class Zipformer2EncoderLayer(nn.Module):
                 float(self.attention_skip_rate) if self.training else 0.0
             )
 
-        # attn_weights: (num_heads, batch_size, seq_len, seq_len)
-        attn_weights = self.self_attn_weights(
-            src,
-            pos_emb=pos_emb,
-            attn_mask=attn_mask,
-            key_padding_mask=src_key_padding_mask,
-        )
+        # Zipformer uses the same attention weights for multiple submodules
+        # (NonlinAttention + two SelfAttention blocks). The default path
+        # materializes explicit attention weights. The optional FlexAttention
+        # path avoids materializing full (H, B, T, T) weights and instead
+        # computes attention outputs directly (still using the same q/k/p
+        # projections as the original implementation).
+        attn_weights: Optional[Tensor] = None
+        q = k = p = pos_emb_proj = None
+        use_pos_scores = False
+        if not self.use_flex_attention:
+            # attn_weights: (num_heads, batch_size, seq_len, seq_len)
+            attn_weights = self.self_attn_weights(
+                src,
+                pos_emb=pos_emb,
+                attn_mask=attn_mask,
+                key_padding_mask=src_key_padding_mask,
+            )
+        else:
+            if _flex_attention is None:
+                raise RuntimeError(
+                    "use_flex_attention=True but torch.nn.attention.flex_attention is "
+                    "not available in this PyTorch build."
+                )
+            q, k, p, pos_emb_proj, use_pos_scores = (
+                self.self_attn_weights.project_q_k_p_and_pos_emb(src, pos_emb)
+            )
 
         src = src + self.feed_forward1(src)
 
@@ -811,7 +843,63 @@ class Zipformer2EncoderLayer(nn.Module):
             src, attention_skip_rate
         )
 
-        selected_attn_weights = attn_weights[0:1]
+        if attn_weights is not None:
+            selected_attn_weights = attn_weights[0:1]
+        else:
+            assert q is not None and k is not None and p is not None
+            (batch_size, num_heads, seq_len, query_head_dim) = q.shape
+            assert num_heads >= 1
+
+            q0 = q[:, 0]  # (B, T, Dq)
+            k0 = k[:, 0]  # (B, T, Dq)
+            attn_scores0 = torch.matmul(q0, k0.transpose(-1, -2))  # (B, T, T)
+
+            if use_pos_scores:
+                assert pos_emb_proj is not None
+                assert pos_emb_proj.shape[0] == batch_size
+                assert pos_emb_proj.shape[1] == num_heads
+                # p0: (B, T, Dp); pos0: (B, 2*T-1, Dp)
+                p0 = p[:, 0]
+                pos0 = pos_emb_proj[:, 0]
+                assert pos0.shape[1] == 2 * seq_len - 1, (pos0.shape, seq_len)
+                # (B, T, Dp) x (B, Dp, 2*T-1) -> (B, T, 2*T-1)
+                pos_scores = torch.matmul(p0, pos0.transpose(-1, -2)).unsqueeze(0)
+                if torch.jit.is_tracing():
+                    (nhead, bsz, time1, n) = pos_scores.shape
+                    rows = torch.arange(start=time1 - 1, end=-1, step=-1)
+                    cols = torch.arange(seq_len)
+                    rows = rows.repeat(bsz * nhead).unsqueeze(-1)
+                    indexes = rows + cols
+                    pos_scores = pos_scores.reshape(-1, n)
+                    pos_scores = torch.gather(pos_scores, dim=1, index=indexes)
+                    pos_scores = pos_scores.reshape(nhead, bsz, time1, seq_len)
+                else:
+                    pos_scores = pos_scores.as_strided(
+                        (1, batch_size, seq_len, seq_len),
+                        (
+                            pos_scores.stride(0),
+                            pos_scores.stride(1),
+                            pos_scores.stride(2) - pos_scores.stride(3),
+                            pos_scores.stride(3),
+                        ),
+                        storage_offset=pos_scores.stride(3) * (seq_len - 1),
+                    )
+                attn_scores0 = attn_scores0 + pos_scores.squeeze(0)
+
+            if attn_mask is not None:
+                assert attn_mask.dtype == torch.bool
+                # attn_mask is (T, T) or (B, T, T); True means masked.
+                attn_scores0 = attn_scores0.masked_fill(attn_mask, -1000)
+
+            if src_key_padding_mask is not None:
+                assert src_key_padding_mask.shape == (batch_size, seq_len)
+                attn_scores0 = attn_scores0.masked_fill(
+                    src_key_padding_mask.unsqueeze(1), -1000
+                )
+
+            attn_weights0 = softmax(attn_scores0, dim=-1)
+            # selected_attn_weights: (1, B, T, T) to match NonlinAttention API.
+            selected_attn_weights = attn_weights0.unsqueeze(0)
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             pass
         elif self.training and random.random() < float(self.const_attention_rate):
@@ -833,7 +921,42 @@ class Zipformer2EncoderLayer(nn.Module):
             na if self_attn_dropout_mask is None else na * self_attn_dropout_mask
         )
 
-        self_attn = self.self_attn1(src, attn_weights)
+        if attn_weights is not None:
+            self_attn = self.self_attn1(src, attn_weights)
+        else:
+            assert _flex_attention is not None
+            assert q is not None and k is not None and p is not None
+            (batch_size, num_heads, seq_len, _d) = q.shape
+
+            v = self.self_attn1.in_proj(src)
+            v = v.reshape(seq_len, batch_size, num_heads, -1).permute(1, 2, 0, 3)
+
+            use_pos = use_pos_scores and pos_emb_proj is not None
+            has_attn_mask = attn_mask is not None
+            has_kpm = src_key_padding_mask is not None
+
+            def score_mod(score, b, h, q_idx, k_idx):
+                if use_pos:
+                    rel = (seq_len - 1) + k_idx - q_idx
+                    score = score + (p[b, h, q_idx] * pos_emb_proj[b, h, rel]).sum(
+                        dim=-1
+                    )
+                if has_attn_mask:
+                    m = (
+                        attn_mask[q_idx, k_idx]
+                        if attn_mask.ndim == 2
+                        else attn_mask[b, q_idx, k_idx]
+                    )
+                    score = torch.where(m, torch.full_like(score, -1000.0), score)
+                if has_kpm:
+                    m = src_key_padding_mask[b, k_idx]
+                    score = torch.where(m, torch.full_like(score, -1000.0), score)
+                return score
+
+            y = _flex_attention(q, k, v, score_mod=score_mod, scale=1.0)
+            y = y.permute(2, 0, 1, 3).contiguous().view(seq_len, batch_size, -1)
+            self_attn = self.self_attn1.out_proj(y)
+            self_attn = self.self_attn1.whiten(self_attn)
 
         src = src + (
             self_attn
@@ -863,7 +986,42 @@ class Zipformer2EncoderLayer(nn.Module):
         # bypass in the middle of the layer.
         src = self.bypass_mid(src_orig, src)
 
-        self_attn = self.self_attn2(src, attn_weights)
+        if attn_weights is not None:
+            self_attn = self.self_attn2(src, attn_weights)
+        else:
+            assert _flex_attention is not None
+            assert q is not None and k is not None and p is not None
+            (batch_size, num_heads, seq_len, _d) = q.shape
+
+            v = self.self_attn2.in_proj(src)
+            v = v.reshape(seq_len, batch_size, num_heads, -1).permute(1, 2, 0, 3)
+
+            use_pos = use_pos_scores and pos_emb_proj is not None
+            has_attn_mask = attn_mask is not None
+            has_kpm = src_key_padding_mask is not None
+
+            def score_mod(score, b, h, q_idx, k_idx):
+                if use_pos:
+                    rel = (seq_len - 1) + k_idx - q_idx
+                    score = score + (p[b, h, q_idx] * pos_emb_proj[b, h, rel]).sum(
+                        dim=-1
+                    )
+                if has_attn_mask:
+                    m = (
+                        attn_mask[q_idx, k_idx]
+                        if attn_mask.ndim == 2
+                        else attn_mask[b, q_idx, k_idx]
+                    )
+                    score = torch.where(m, torch.full_like(score, -1000.0), score)
+                if has_kpm:
+                    m = src_key_padding_mask[b, k_idx]
+                    score = torch.where(m, torch.full_like(score, -1000.0), score)
+                return score
+
+            y = _flex_attention(q, k, v, score_mod=score_mod, scale=1.0)
+            y = y.permute(2, 0, 1, 3).contiguous().view(seq_len, batch_size, -1)
+            self_attn = self.self_attn2.out_proj(y)
+            self_attn = self.self_attn2.whiten(self_attn)
 
         src = src + (
             self_attn
@@ -1623,6 +1781,94 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         # the following are for diagnostics only, see --print-diagnostics option
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
+
+    def project_q_k_p_and_pos_emb(
+        self,
+        x: Tensor,
+        pos_emb: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], bool]:
+        """Project inputs into q/k/p and optionally project pos_emb.
+
+        This helper is used by the optional FlexAttention path in
+        :class:`Zipformer2EncoderLayer`. It mirrors the projections and
+        whitening/balancing done in :meth:`forward`, but does not materialize
+        attention weights.
+
+        Args:
+          x:
+            Input of shape (seq_len, batch_size, embed_dim).
+          pos_emb:
+            Positional embedding tensor of shape (1, 2*seq_len-1, pos_dim) or
+            (batch_size, 2*seq_len-1, pos_dim).
+
+        Returns:
+          q:
+            Tensor of shape (batch_size, num_heads, seq_len, query_head_dim).
+          k:
+            Tensor of shape (batch_size, num_heads, seq_len, query_head_dim).
+          p:
+            Tensor of shape (batch_size, num_heads, seq_len, pos_head_dim).
+          pos_emb_proj:
+            Projected positional embeddings of shape
+            (batch_size, num_heads, 2*seq_len-1, pos_head_dim) if
+            ``use_pos_scores`` else None.
+          use_pos_scores:
+            Whether to include relative positional scores (matches :meth:`forward`).
+        """
+        x = self.in_proj(x)
+        query_head_dim = self.query_head_dim
+        pos_head_dim = self.pos_head_dim
+        num_heads = self.num_heads
+
+        seq_len, batch_size, _ = x.shape
+        expected_seq_len2 = 2 * seq_len - 1
+        assert pos_emb.shape[1] == expected_seq_len2, (
+            pos_emb.shape,
+            expected_seq_len2,
+        )
+
+        query_dim = query_head_dim * num_heads
+
+        q = x[..., 0:query_dim]
+        k = x[..., query_dim : 2 * query_dim]
+        p = x[..., 2 * query_dim :]
+        assert p.shape[-1] == num_heads * pos_head_dim, (
+            p.shape[-1],
+            num_heads,
+            pos_head_dim,
+        )
+
+        q = self.copy_query(q)  # diagnostics only
+        k = self.whiten_keys(self.balance_keys(k))
+        p = self.copy_pos_query(p)  # diagnostics only
+
+        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim).permute(1, 2, 0, 3)
+        k = k.reshape(seq_len, batch_size, num_heads, query_head_dim).permute(1, 2, 0, 3)
+        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim).permute(1, 2, 0, 3)
+
+        use_pos_scores = False
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            use_pos_scores = True
+        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
+            use_pos_scores = True
+
+        pos_emb_proj: Optional[Tensor] = None
+        if use_pos_scores:
+            pos_emb_lin = self.linear_pos(pos_emb)
+            # shape: (pos_batch, seq_len2, num_heads, pos_head_dim)
+            pos_emb_lin = pos_emb_lin.reshape(
+                -1, expected_seq_len2, num_heads, pos_head_dim
+            ).permute(0, 2, 1, 3)
+            if pos_emb_lin.shape[0] == 1 and batch_size > 1:
+                pos_emb_lin = pos_emb_lin.expand(batch_size, -1, -1, -1)
+            else:
+                assert pos_emb_lin.shape[0] == batch_size, (
+                    pos_emb_lin.shape,
+                    batch_size,
+                )
+            pos_emb_proj = pos_emb_lin
+
+        return q, k, p, pos_emb_proj, use_pos_scores
 
     def forward(
         self,

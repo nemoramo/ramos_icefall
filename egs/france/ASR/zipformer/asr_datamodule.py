@@ -109,6 +109,15 @@ class MSR_AsrDataModule:
             "single batch. You can reduce it if it causes CUDA OOM.",
         )
         group.add_argument(
+            "--max-cuts",
+            type=int,
+            default=0,
+            help=(
+                "Maximum number of cuts in a single batch (used by "
+                "DynamicBucketingSampler). Set <= 0 to disable."
+            ),
+        )
+        group.add_argument(
             "--bucketing-sampler",
             type=str2bool,
             default=True,
@@ -161,6 +170,15 @@ class MSR_AsrDataModule:
             default=1.0,
             help="Determines the maximum duration of a concatenated cut "
             "relative to the duration of the longest cut in a batch.",
+        )
+        group.add_argument(
+            "--concatenate-cuts-max-duration",
+            type=float,
+            default=0.0,
+            help=(
+                "Upper bound (seconds) for each concatenated/packed cut when "
+                "--concatenate-cuts is enabled. Set <= 0 to disable."
+            ),
         )
         group.add_argument(
             "--gap",
@@ -315,16 +333,20 @@ class MSR_AsrDataModule:
             logging.info("Disable MUSAN")
 
         if self.args.concatenate_cuts:
+            pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
             logging.info(
                 f"Using cut concatenation with duration factor "
-                f"{self.args.duration_factor} and gap {self.args.gap}."
+                f"{self.args.duration_factor}, gap {self.args.gap}, "
+                f"max_duration {pack_max_dur if pack_max_dur > 0 else 'None'}."
             )
             # Cut concatenation should be the first transform in the list,
             # so that if we e.g. mix noise in, it will fill the gaps between
             # different utterances.
             transforms = [
                 CutConcatenate(
-                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                    duration_factor=self.args.duration_factor,
+                    gap=self.args.gap,
+                    max_duration=pack_max_dur if pack_max_dur > 0 else None,
                 )
             ] + transforms
 
@@ -390,6 +412,8 @@ class MSR_AsrDataModule:
                 shuffle_buffer_size=self.args.bucketing_shuffle_buffer_size,
                 drop_last=self.args.drop_last,
             )
+            if int(self.args.max_cuts) > 0:
+                sampler_kwargs["max_cuts"] = int(self.args.max_cuts)
             if getattr(self.args, "world_size", 1) > 1:
                 sampler_kwargs.update(
                     world_size=int(getattr(self.args, "world_size", 1)),
@@ -441,9 +465,12 @@ class MSR_AsrDataModule:
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
         transforms = []
         if getattr(self.args, "valid_concatenate_cuts", False):
+            pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
             transforms = [
                 CutConcatenate(
-                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                    duration_factor=self.args.duration_factor,
+                    gap=self.args.gap,
+                    max_duration=pack_max_dur if pack_max_dur > 0 else None,
                 )
             ] + transforms
 
