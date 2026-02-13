@@ -102,9 +102,6 @@ def main() -> None:
     args = get_args()
     lowercase = bool(args.lowercase)
 
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available.")
