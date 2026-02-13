@@ -107,8 +107,19 @@ def main() -> None:
         raise RuntimeError("CUDA requested but not available.")
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    raw_params = ckpt.get("params", {})
-    if isinstance(raw_params, AttributeDict):
+    raw_params = ckpt.get("params", None)
+    if raw_params is None:
+        # Newer checkpoints store training params flattened at top-level.
+        ignore = {
+            "model",
+            "optimizer",
+            "scheduler",
+            "grad_scaler",
+            "sampler",
+            "model_avg",
+        }
+        params = AttributeDict({k: v for k, v in ckpt.items() if k not in ignore})
+    elif isinstance(raw_params, AttributeDict):
         params = raw_params
     else:
         params = AttributeDict(dict(raw_params))
