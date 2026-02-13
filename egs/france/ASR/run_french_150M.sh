@@ -22,16 +22,13 @@ VALID_CUTS_FILENAME="${VALID_CUTS_FILENAME:-msr_cuts_French_valid.jsonl.gz}"
 TEST_CUTS_FILENAME="${TEST_CUTS_FILENAME:-msr_cuts_French_test.jsonl.gz}"
 MUSAN_CUTS_FILENAME="${MUSAN_CUTS_FILENAME:-musan_cuts_modify.jsonl.gz}"
 
-# Preferred French BPE model path. If unavailable, pick first local ASR bpe.model.
-BPE_MODEL="${BPE_MODEL:-${SCRIPT_DIR}/data/france/lang_bpe_2000/bpe.model}"
+# French SentencePiece model (must match the dataset language).
+# NOTE: We intentionally avoid auto-fallback search to prevent accidentally
+# picking an unrelated language model.
+BPE_MODEL="${BPE_MODEL:-${DATA_ROOT}/data/french/lang_bpe_2048/bpe.model}"
 if [[ ! -f "${BPE_MODEL}" ]]; then
-  FALLBACK_BPE="$(find "${SCRIPT_DIR}/data" -type f -path "*/lang_bpe_2000/bpe.model" | head -n 1 || true)"
-  if [[ -n "${FALLBACK_BPE}" ]]; then
-    BPE_MODEL="${FALLBACK_BPE}"
-  fi
-fi
-if [[ ! -f "${BPE_MODEL}" ]]; then
-  echo "BPE model not found. Set BPE_MODEL explicitly."
+  echo "BPE model not found at: ${BPE_MODEL}"
+  echo "Set BPE_MODEL explicitly (expected a French SentencePiece model)."
   exit 1
 fi
 
