@@ -302,6 +302,7 @@ class Zipformer2(EncoderInterface):
         x: Tensor,
         x_lens: Tensor,
         src_key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -313,6 +314,11 @@ class Zipformer2(EncoderInterface):
           src_key_padding_mask:
             The mask for padding, of shape (batch_size, seq_len); True means
             masked position. May be None.
+          attn_mask:
+            Optional attention mask, of shape (seq_len, seq_len) or
+            (batch_size, seq_len, seq_len); True means masked position.
+            This will be combined with the internal chunkwise attention mask
+            (if any).
         Returns:
           Return a tuple containing 2 tensors:
             - embeddings: its shape is (output_seq_len, batch_size, max(encoder_dim))
@@ -327,11 +333,25 @@ class Zipformer2(EncoderInterface):
 
         chunk_size, left_context_chunks = self.get_chunk_info()
 
+        # Combine the optional external attention mask with the internal
+        # chunkwise attention mask (used only for causal chunking).
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             # Not support exporting a model for simulating streaming decoding
-            attn_mask = None
+            chunk_attn_mask = None
         else:
-            attn_mask = self._get_attn_mask(x, chunk_size, left_context_chunks)
+            chunk_attn_mask = self._get_attn_mask(x, chunk_size, left_context_chunks)
+
+        if attn_mask is None:
+            combined_attn_mask = chunk_attn_mask
+        elif chunk_attn_mask is None:
+            combined_attn_mask = attn_mask
+        else:
+            # Allow 2D chunk mask to combine with 3D (per-batch) external mask.
+            if attn_mask.ndim == 3 and chunk_attn_mask.ndim == 2:
+                chunk_attn_mask = chunk_attn_mask.unsqueeze(0)
+            elif attn_mask.ndim == 2 and chunk_attn_mask.ndim == 3:
+                attn_mask = attn_mask.unsqueeze(0)
+            combined_attn_mask = torch.logical_or(attn_mask, chunk_attn_mask)
 
         for i, module in enumerate(self.encoders):
             ds = self.downsampling_factor[i]
@@ -346,7 +366,7 @@ class Zipformer2(EncoderInterface):
                     if src_key_padding_mask is None
                     else src_key_padding_mask[..., ::ds]
                 ),
-                attn_mask=attn_mask,
+                attn_mask=combined_attn_mask,
             )
             outputs.append(x)
 
@@ -1264,7 +1284,13 @@ class DownsampledZipformer2Encoder(nn.Module):
         src = self.downsample(src)
         ds = self.downsample_factor
         if attn_mask is not None:
-            attn_mask = attn_mask[::ds, ::ds]
+            # Support both (seq_len, seq_len) and (batch_size, seq_len, seq_len)
+            # attention masks.
+            if attn_mask.ndim == 2:
+                attn_mask = attn_mask[::ds, ::ds]
+            else:
+                assert attn_mask.ndim == 3, attn_mask.shape
+                attn_mask = attn_mask[:, ::ds, ::ds]
 
         src = self.encoder(
             src,

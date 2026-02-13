@@ -100,6 +100,7 @@ from icefall.hooks import register_inf_check_hooks
 from icefall.utils import (
     AttributeDict,
     MetricsTracker,
+    encode_supervisions,
     get_parameter_groups_with_lrs,
     setup_logger,
     str2bool,
@@ -127,6 +128,87 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
             module.batch_count = batch_count
         if hasattr(module, "name"):
             module.name = name
+
+
+def build_packed_attention_mask(
+    supervisions: Dict[str, Any],
+    seq_lens: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a dense (B, T, T) boolean mask for packed CutConcatenate batches.
+
+    The mask is block-diagonal w.r.t. original utterances (supervisions) inside
+    each packed cut. Gap/padding frames get block_id=0.
+
+    Note: This is a train-time helper; it intentionally prioritizes correctness
+    over maximum efficiency.
+    """
+    num_seqs = len(seq_lens)
+    if num_seqs == 0:
+        return torch.empty((0, 0, 0), dtype=torch.bool, device=device)
+
+    # Conv2dSubsampling reduces length as: (T - 7) // 2
+    embed_lens = [max(0, (int(L) - 7) // 2) for L in seq_lens]
+    t_max = max(embed_lens) if embed_lens else 0
+    if t_max <= 0:
+        return torch.empty((num_seqs, 0, 0), dtype=torch.bool, device=device)
+
+    # Build block ids on CPU to avoid many tiny GPU slice assignments.
+    block_id = torch.zeros((num_seqs, t_max), dtype=torch.int32)
+
+    seq_idx = supervisions["sequence_idx"]
+    start_frame = supervisions["start_frame"]
+    num_frames = supervisions["num_frames"]
+
+    if isinstance(seq_idx, torch.Tensor):
+        seq_idx = seq_idx.detach().cpu().tolist()
+        start_frame = start_frame.detach().cpu().tolist()
+        num_frames = num_frames.detach().cpu().tolist()
+
+    segs_by_seq: List[List[Tuple[int, int]]] = [[] for _ in range(num_seqs)]
+    for b, st, nf in zip(seq_idx, start_frame, num_frames):
+        b = int(b)
+        st = int(st)
+        nf = int(nf)
+        end = st + nf
+
+        # Map raw feature-frame indices to encoder-embed frame indices.
+        # We mirror Conv2dSubsampling length formula to stay consistent.
+        s = (st - 7) // 2
+        e = (end - 7) // 2
+        if s < 0:
+            s = 0
+        if e < 0:
+            e = 0
+        segs_by_seq[b].append((s, e))
+
+    for b in range(num_seqs):
+        segs = segs_by_seq[b]
+        if not segs:
+            continue
+        segs.sort(key=lambda x: x[0])
+
+        L = int(embed_lens[b])
+        if L <= 0:
+            continue
+
+        next_id = 1
+        for s, e in segs:
+            if s < 0:
+                s = 0
+            if s >= L:
+                s = L - 1
+            if e > L:
+                e = L
+            if e <= s:
+                e = min(s + 1, L)
+
+            block_id[b, s:e] = next_id
+            next_id += 1
+
+    block_id = block_id.to(device)
+    # True means masked position.
+    return block_id[:, :, None] != block_id[:, None, :]
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
@@ -436,6 +518,25 @@ def get_parser():
         type=int,
         default=50,
         help="Print training stats every this many local batches.",
+    )
+
+    parser.add_argument(
+        "--use-packed-supervisions",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True (train-only), support CutConcatenate packing by slicing encoder outputs "
+            "per supervision segment and computing RNNT/CTC losses independently per original utterance."
+        ),
+    )
+    parser.add_argument(
+        "--pack-attn-mask",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True (requires --use-packed-supervisions), build a dense per-batch "
+            "block-diagonal attention mask to prevent attention across concatenated utterances."
+        ),
     )
 
     parser.add_argument(
@@ -972,21 +1073,59 @@ def compute_loss(
       warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = next(model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
+    # Compute per-sequence lengths. This is required when CutConcatenate packing is used
+    # (multiple supervisions per sequence), and is equivalent to num_frames in the
+    # non-packed case.
+    seq_idx = supervisions["sequence_idx"]
+    start_frame = supervisions["start_frame"]
+    num_frames = supervisions["num_frames"]
+    if isinstance(seq_idx, torch.Tensor):
+        seq_idx = seq_idx.detach().cpu().tolist()
+        start_frame = start_frame.detach().cpu().tolist()
+        num_frames = num_frames.detach().cpu().tolist()
+
+    num_seqs = feature.size(0)
+    feature_lens_list = [0] * num_seqs
+    for b, st, nf in zip(seq_idx, start_frame, num_frames):
+        b = int(b)
+        end = int(st) + int(nf)
+        if end > feature_lens_list[b]:
+            feature_lens_list[b] = end
+
+    feature_lens = torch.tensor(feature_lens_list, device=device, dtype=torch.int64)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y)
+    use_packed = is_training and getattr(params, "use_packed_supervisions", False)
+    if use_packed and getattr(params, "pack_attn_mask", False):
+        attn_mask = build_packed_attention_mask(
+            supervisions=supervisions, seq_lens=feature_lens_list, device=device
+        )
+    else:
+        attn_mask = None
+
+    if use_packed:
+        # Sort supervision segments by duration (descending) and re-order texts
+        # consistently. We'll compute losses independently per supervision segment.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            packed_supervision_segments, texts = encode_supervisions(
+                supervisions, subsampling_factor=params.subsampling_factor
+            )
+        y = sp.encode(texts, out_type=int)
+        y = k2.RaggedTensor(y)
+    else:
+        texts = batch["supervisions"]["text"]
+        y = sp.encode(texts, out_type=int)
+        y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
         # Newer AsrModel returns (simple_loss, pruned_loss, ctc_loss,
@@ -998,6 +1137,10 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            attn_mask=attn_mask,
+            packed_supervision_segments=packed_supervision_segments
+            if use_packed
+            else None,
         )
 
         loss = 0.0

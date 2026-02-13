@@ -148,6 +148,14 @@ class MSR_AsrDataModule:
             "to minimize the amount of padding.",
         )
         group.add_argument(
+            "--valid-concatenate-cuts",
+            type=str2bool,
+            default=False,
+            help="When enabled, validation utterances (cuts) will be concatenated "
+            "to minimize the amount of padding. Recommended to keep it disabled "
+            "to avoid changing validation/WER semantics.",
+        )
+        group.add_argument(
             "--duration-factor",
             type=float,
             default=1.0,
@@ -432,7 +440,7 @@ class MSR_AsrDataModule:
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
         transforms = []
-        if self.args.concatenate_cuts:
+        if getattr(self.args, "valid_concatenate_cuts", False):
             transforms = [
                 CutConcatenate(
                     duration_factor=self.args.duration_factor, gap=self.args.gap
