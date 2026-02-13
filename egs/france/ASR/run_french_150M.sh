@@ -42,6 +42,8 @@ EXP_DIR="${EXP_DIR:-${DATA_ROOT}/experiments/zipformer/$(date +%Y%m%d)_france_on
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${EXP_DIR}/tensorboard}"
 MAX_DURATION="${MAX_DURATION:-3000}"
 MAX_TRAIN_CUT_DURATION="${MAX_TRAIN_CUT_DURATION:-30}"
+MAX_VALID_CUT_DURATION="${MAX_VALID_CUT_DURATION:-${MAX_TRAIN_CUT_DURATION}}"
+VALID_NUM_CUTS="${VALID_NUM_CUTS:-2000}"
 NUM_BUCKETS="${NUM_BUCKETS:-60}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
 VALID_NUM_WORKERS="${VALID_NUM_WORKERS:-5}"
@@ -82,6 +84,8 @@ python ./zipformer/train.py \
   --start-batch "${START_BATCH}" \
   --max-duration "${MAX_DURATION}" \
   --max-train-cut-duration "${MAX_TRAIN_CUT_DURATION}" \
+  --max-valid-cut-duration "${MAX_VALID_CUT_DURATION}" \
+  --valid-num-cuts "${VALID_NUM_CUTS}" \
   --num-buckets "${NUM_BUCKETS}" \
   --causal 1 \
   --use-fp16 1 \

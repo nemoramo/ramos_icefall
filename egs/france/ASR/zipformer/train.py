@@ -366,6 +366,24 @@ def get_parser():
             "Set <= 0 to disable this filter."
         ),
     )
+    parser.add_argument(
+        "--max-valid-cut-duration",
+        type=float,
+        default=0.0,
+        help=(
+            "Drop validation cuts longer than this duration (seconds). "
+            "Set <= 0 to reuse --max-train-cut-duration."
+        ),
+    )
+    parser.add_argument(
+        "--valid-num-cuts",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, use only the first N validation cuts (after filtering) "
+            "to speed up validation/WER."
+        ),
+    )
     
     parser.add_argument(
         "--world-size",
@@ -1776,6 +1794,22 @@ def run(rank, world_size, args):
     )
 
     valid_cuts = msr.dev_cuts()
+    max_valid_dur = float(getattr(params, "max_valid_cut_duration", 0.0))
+    if max_valid_dur <= 0:
+        max_valid_dur = float(getattr(params, "max_train_cut_duration", 0.0))
+    if max_valid_dur > 0:
+        logging.info(
+            "Applying validation duration filter: keep cuts with duration <= %.2fs",
+            max_valid_dur,
+        )
+        valid_cuts = valid_cuts.filter(lambda c: c.duration <= max_valid_dur)
+
+    if getattr(params, "valid_num_cuts", 0) > 0:
+        logging.info(
+            "Subsetting validation cuts to first %d cuts",
+            int(params.valid_num_cuts),
+        )
+        valid_cuts = valid_cuts.subset(first=int(params.valid_num_cuts))
     valid_dl = msr.valid_dataloaders(valid_cuts)
 
     if params.print_diagnostics:
