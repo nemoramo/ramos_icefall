@@ -44,6 +44,8 @@ from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
 
+from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
+
 
 class _SeedWorkers:
     def __init__(self, seed: int):
@@ -109,6 +111,16 @@ class MSR_AsrDataModule:
             "single batch. You can reduce it if it causes CUDA OOM.",
         )
         group.add_argument(
+            "--quadratic-duration",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional quadratic-duration correction for transformer-like models. "
+                "It modifies the effective duration as: dur + dur^2 / Q. "
+                "Recommended values are in [15, 40]. Set <= 0 to disable."
+            ),
+        )
+        group.add_argument(
             "--max-cuts",
             type=int,
             default=0,
@@ -155,6 +167,16 @@ class MSR_AsrDataModule:
             default=False,
             help="When enabled, utterances (cuts) will be concatenated "
             "to minimize the amount of padding.",
+        )
+        group.add_argument(
+            "--ddp-pack-sampler",
+            type=str2bool,
+            default=False,
+            help=(
+                "When enabled (DDP only), perform CutConcatenate packing inside the sampler "
+                "and then split packed cuts across ranks to balance compute. "
+                "This improves per-rank batch-shape consistency compared to packing in the dataset."
+            ),
         )
         group.add_argument(
             "--valid-concatenate-cuts",
@@ -319,6 +341,13 @@ class MSR_AsrDataModule:
             The state dict for the training sampler.
         """
         transforms = []
+        world_size = int(getattr(self.args, "world_size", 1))
+        rank = int(getattr(self.args, "rank", 0))
+        use_ddp_pack_sampler = (
+            bool(getattr(self.args, "ddp_pack_sampler", False))
+            and world_size > 1
+            and bool(getattr(self.args, "concatenate_cuts", False))
+        )
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
             logging.info("About to get Musan cuts")
@@ -339,16 +368,22 @@ class MSR_AsrDataModule:
                 f"{self.args.duration_factor}, gap {self.args.gap}, "
                 f"max_duration {pack_max_dur if pack_max_dur > 0 else 'None'}."
             )
-            # Cut concatenation should be the first transform in the list,
-            # so that if we e.g. mix noise in, it will fill the gaps between
-            # different utterances.
-            transforms = [
-                CutConcatenate(
-                    duration_factor=self.args.duration_factor,
-                    gap=self.args.gap,
-                    max_duration=pack_max_dur if pack_max_dur > 0 else None,
+            if use_ddp_pack_sampler:
+                logging.info(
+                    "DDP pack sampler enabled: moving CutConcatenate packing into the sampler; "
+                    "disabling dataset-side CutConcatenate."
                 )
-            ] + transforms
+            else:
+                # Cut concatenation should be the first transform in the list,
+                # so that if we e.g. mix noise in, it will fill the gaps between
+                # different utterances.
+                transforms = [
+                    CutConcatenate(
+                        duration_factor=self.args.duration_factor,
+                        gap=self.args.gap,
+                        max_duration=pack_max_dur if pack_max_dur > 0 else None,
+                    )
+                ] + transforms
 
         input_transforms = []
         if self.args.enable_spec_aug:
@@ -414,7 +449,32 @@ class MSR_AsrDataModule:
             )
             if int(self.args.max_cuts) > 0:
                 sampler_kwargs["max_cuts"] = int(self.args.max_cuts)
-            if getattr(self.args, "world_size", 1) > 1:
+            q = float(getattr(self.args, "quadratic_duration", 0.0))
+            if q > 0:
+                sampler_kwargs["quadratic_duration"] = q
+
+            if use_ddp_pack_sampler:
+                pack_max_dur = float(
+                    getattr(self.args, "concatenate_cuts_max_duration", 0.0)
+                )
+                train_sampler = PackAwareDistributedDynamicBucketingSampler(
+                    cuts_train,
+                    max_duration=float(self.args.max_duration),
+                    max_cuts=int(self.args.max_cuts) if int(self.args.max_cuts) > 0 else None,
+                    shuffle=bool(self.args.shuffle),
+                    drop_last=bool(self.args.drop_last),
+                    num_buckets=int(self.args.num_buckets),
+                    buffer_size=int(self.args.bucketing_buffer_size),
+                    shuffle_buffer_size=int(self.args.bucketing_shuffle_buffer_size),
+                    quadratic_duration=q if q > 0 else None,
+                    world_size=world_size,
+                    rank=rank,
+                    seed=int(getattr(self.args, "seed", 0)),
+                    gap=float(self.args.gap),
+                    duration_factor=float(self.args.duration_factor),
+                    pack_max_duration=pack_max_dur if pack_max_dur > 0 else None,
+                )
+            elif getattr(self.args, "world_size", 1) > 1:
                 sampler_kwargs.update(
                     world_size=int(getattr(self.args, "world_size", 1)),
                     rank=int(getattr(self.args, "rank", 0)),
@@ -426,9 +486,16 @@ class MSR_AsrDataModule:
                     sampler_kwargs["world_size"],
                     sampler_kwargs["rank"],
                 )
-            train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
+                train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
+            else:
+                train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
         else:
             logging.info("Using SimpleCutSampler.")
+            if use_ddp_pack_sampler:
+                logging.warning(
+                    "DDP pack sampler requested but bucketing sampler is disabled; "
+                    "falling back to SimpleCutSampler."
+                )
             train_sampler = SimpleCutSampler(
                 cuts_train,
                 max_duration=self.args.max_duration,
