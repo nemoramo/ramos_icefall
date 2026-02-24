@@ -93,6 +93,27 @@ TORCH_COMPILE_MODE="${TORCH_COMPILE_MODE:-default}"
 TORCH_COMPILE_DYNAMIC="${TORCH_COMPILE_DYNAMIC:-1}"
 TORCH_COMPILE_FULLGRAPH="${TORCH_COMPILE_FULLGRAPH:-0}"
 
+# FlexAttention (optional; note: flex_attention+torch.compile may require newer torch).
+USE_FLEX_ATTENTION="${USE_FLEX_ATTENTION:-0}"
+QUERY_HEAD_DIM="${QUERY_HEAD_DIM:-32}"
+VALUE_HEAD_DIM="${VALUE_HEAD_DIM:-12}"
+
+# torch.profiler (optional).
+TORCH_PROFILER="${TORCH_PROFILER:-0}"
+TORCH_PROFILER_RANK0_ONLY="${TORCH_PROFILER_RANK0_ONLY:-1}"
+TORCH_PROFILER_DIR="${TORCH_PROFILER_DIR:-}"
+TORCH_PROFILER_START_STEP="${TORCH_PROFILER_START_STEP:--1}"
+TORCH_PROFILER_WAIT="${TORCH_PROFILER_WAIT:-0}"
+TORCH_PROFILER_WARMUP="${TORCH_PROFILER_WARMUP:-5}"
+TORCH_PROFILER_ACTIVE="${TORCH_PROFILER_ACTIVE:-20}"
+TORCH_PROFILER_REPEAT="${TORCH_PROFILER_REPEAT:-1}"
+TORCH_PROFILER_RECORD_SHAPES="${TORCH_PROFILER_RECORD_SHAPES:-0}"
+TORCH_PROFILER_PROFILE_MEMORY="${TORCH_PROFILER_PROFILE_MEMORY:-0}"
+TORCH_PROFILER_WITH_STACK="${TORCH_PROFILER_WITH_STACK:-0}"
+TORCH_PROFILER_WITH_FLOPS="${TORCH_PROFILER_WITH_FLOPS:-0}"
+TORCH_PROFILER_EXPORT_KEY_AVERAGES="${TORCH_PROFILER_EXPORT_KEY_AVERAGES:-1}"
+TORCH_PROFILER_ROW_LIMIT="${TORCH_PROFILER_ROW_LIMIT:-50}"
+
 python ./zipformer/train.py \
   --world-size "${WORLD_SIZE}" \
   --dist-backend "${DIST_BACKEND}" \
@@ -132,6 +153,23 @@ python ./zipformer/train.py \
   --torch-compile-mode "${TORCH_COMPILE_MODE}" \
   --torch-compile-dynamic "${TORCH_COMPILE_DYNAMIC}" \
   --torch-compile-fullgraph "${TORCH_COMPILE_FULLGRAPH}" \
+  --use-flex-attention "${USE_FLEX_ATTENTION}" \
+  --query-head-dim "${QUERY_HEAD_DIM}" \
+  --value-head-dim "${VALUE_HEAD_DIM}" \
+  --torch-profiler "${TORCH_PROFILER}" \
+  --torch-profiler-rank0-only "${TORCH_PROFILER_RANK0_ONLY}" \
+  --torch-profiler-dir "${TORCH_PROFILER_DIR}" \
+  --torch-profiler-start-step "${TORCH_PROFILER_START_STEP}" \
+  --torch-profiler-wait "${TORCH_PROFILER_WAIT}" \
+  --torch-profiler-warmup "${TORCH_PROFILER_WARMUP}" \
+  --torch-profiler-active "${TORCH_PROFILER_ACTIVE}" \
+  --torch-profiler-repeat "${TORCH_PROFILER_REPEAT}" \
+  --torch-profiler-record-shapes "${TORCH_PROFILER_RECORD_SHAPES}" \
+  --torch-profiler-profile-memory "${TORCH_PROFILER_PROFILE_MEMORY}" \
+  --torch-profiler-with-stack "${TORCH_PROFILER_WITH_STACK}" \
+  --torch-profiler-with-flops "${TORCH_PROFILER_WITH_FLOPS}" \
+  --torch-profiler-export-key-averages "${TORCH_PROFILER_EXPORT_KEY_AVERAGES}" \
+  --torch-profiler-row-limit "${TORCH_PROFILER_ROW_LIMIT}" \
   --skip-oom-scan "${SKIP_OOM_SCAN}" \
   --skip-oom-batch "${SKIP_OOM_BATCH}" \
   --filter-cuts "${FILTER_CUTS}" \
