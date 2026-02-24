@@ -73,7 +73,9 @@ def _split_packed_cuts_by_count_and_sum_dur(
     def num_sup(c: Any) -> int:
         try:
             sups = getattr(c, "supervisions", None)
-            return int(len(sups)) if sups is not None else 1
+            if sups is None:
+                return 1
+            return max(1, int(len(sups)))
         except Exception:
             return 1
 
