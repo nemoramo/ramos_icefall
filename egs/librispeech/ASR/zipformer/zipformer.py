@@ -945,14 +945,10 @@ class Zipformer2EncoderLayer(nn.Module):
             if use_pos:
                 assert pos_emb_proj is not None
                 pos_head_dim = p.shape[-1]
-                # NOTE: FlexAttention backward currently doesn't like score_mods
-                # that index a captured tensor to a vector and then do vector
-                # ops (e.g. dot-product). Work around by selecting each dim
-                # ahead of time and doing scalar indexing/mul/add in score_mod.
-                p_cols = [p.select(-1, d) for d in range(pos_head_dim)]  # (B,H,T)
-                pos_cols = [
-                    pos_emb_proj.select(-1, d) for d in range(pos_head_dim)
-                ]  # (B,H,2*T-1)
+                # NOTE: Keep score_mod scalar-only (avoid vector ops) for current
+                # FlexAttention backward. Also avoid pre-building per-dim tensor
+                # views (p_cols/pos_cols) as it can confuse Dynamo symbolic-shape
+                # source tracking when compiling.
             has_attn_mask = attn_mask is not None
             has_kpm = src_key_padding_mask is not None
 
@@ -960,7 +956,7 @@ class Zipformer2EncoderLayer(nn.Module):
                 if use_pos:
                     rel = (seq_len - 1) + k_idx - q_idx
                     for d in range(pos_head_dim):
-                        score = score + p_cols[d][b, h, q_idx] * pos_cols[d][b, h, rel]
+                        score = score + p[b, h, q_idx, d] * pos_emb_proj[b, h, rel, d]
                 if has_attn_mask:
                     m = (
                         attn_mask[q_idx, k_idx]
@@ -1021,10 +1017,6 @@ class Zipformer2EncoderLayer(nn.Module):
                 assert pos_emb_proj is not None
                 pos_head_dim = p.shape[-1]
                 # See note above in self_attn1: keep score_mod scalar-only.
-                p_cols = [p.select(-1, d) for d in range(pos_head_dim)]  # (B,H,T)
-                pos_cols = [
-                    pos_emb_proj.select(-1, d) for d in range(pos_head_dim)
-                ]  # (B,H,2*T-1)
             has_attn_mask = attn_mask is not None
             has_kpm = src_key_padding_mask is not None
 
@@ -1032,7 +1024,7 @@ class Zipformer2EncoderLayer(nn.Module):
                 if use_pos:
                     rel = (seq_len - 1) + k_idx - q_idx
                     for d in range(pos_head_dim):
-                        score = score + p_cols[d][b, h, q_idx] * pos_cols[d][b, h, rel]
+                        score = score + p[b, h, q_idx, d] * pos_emb_proj[b, h, rel, d]
                 if has_attn_mask:
                     m = (
                         attn_mask[q_idx, k_idx]
