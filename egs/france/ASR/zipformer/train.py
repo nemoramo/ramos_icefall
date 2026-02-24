@@ -109,6 +109,67 @@ from icefall.utils import (
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
 
+def _parse_cuda_visible_devices() -> Optional[List[int]]:
+    """Return physical GPU indices listed in CUDA_VISIBLE_DEVICES if it's simple '0,1,2' form.
+
+    If CUDA_VISIBLE_DEVICES uses UUIDs or other formats, return None.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cvd:
+        return None
+    devs: List[int] = []
+    for part in cvd.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            return None
+        devs.append(int(part))
+    return devs or None
+
+
+def _query_nvidia_smi() -> Optional[Dict[int, Dict[str, float]]]:
+    """Query GPU util/mem via nvidia-smi.
+
+    Returns:
+      {gpu_index: {"util_gpu": %, "util_mem": %, "mem_used_mb": MB, "mem_total_mb": MB}}
+      or None if unavailable.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        import subprocess
+
+        indices = _parse_cuda_visible_devices()
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        if indices:
+            cmd += ["-i", ",".join(map(str, indices))]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        return None
+
+    stats: Dict[int, Dict[str, float]] = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 5:
+            continue
+        try:
+            idx = int(parts[0])
+            stats[idx] = {
+                "util_gpu": float(parts[1]),
+                "util_mem": float(parts[2]),
+                "mem_used_mb": float(parts[3]),
+                "mem_total_mb": float(parts[4]),
+            }
+        except Exception:
+            continue
+    return stats or None
+
+
 def get_adjusted_batch_count(params: AttributeDict) -> float:
     # returns the number of batches we would have used so far if we had used the reference
     # duration.  This is for purposes of set_batch_count().
@@ -1666,6 +1727,25 @@ def train_one_epoch(
                     gpu_mem_reserved_mb,
                     params.batch_idx_train,
                 )
+                # GPU utilization curve (from nvidia-smi). Best-effort only.
+                smi = _query_nvidia_smi()
+                if smi:
+                    idxs = sorted(smi.keys())
+                    util_avg = sum(smi[i]["util_gpu"] for i in idxs) / max(1, len(idxs))
+                    tb_writer.add_scalar(
+                        "train/gpu_util_avg", util_avg, params.batch_idx_train
+                    )
+                    for i in idxs:
+                        tb_writer.add_scalar(
+                            f"train/gpu_util_gpu{i}",
+                            smi[i]["util_gpu"],
+                            params.batch_idx_train,
+                        )
+                        tb_writer.add_scalar(
+                            f"train/gpu_mem_used_mb_gpu{i}",
+                            smi[i]["mem_used_mb"],
+                            params.batch_idx_train,
+                        )
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
