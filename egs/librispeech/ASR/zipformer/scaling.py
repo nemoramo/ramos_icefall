@@ -29,6 +29,34 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from icefall.utils import torch_autocast
 
 
+def _is_torch_compiling() -> bool:
+    """Best-effort check for torch.compile tracing/compiling context.
+
+    We use this to avoid non-traceable side-effects (e.g. querying CUDA memory,
+    python RNG, or updating python state) when torch.compile is enabled.
+    """
+    try:
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None:
+            fn = getattr(compiler, "is_compiling", None)
+            if callable(fn):
+                return bool(fn())
+    except Exception:
+        pass
+
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        if dynamo is None:
+            import torch._dynamo as dynamo  # type: ignore
+        fn = getattr(dynamo, "is_compiling", None)
+        if callable(fn):
+            return bool(fn())
+    except Exception:
+        pass
+
+    return False
+
+
 def logaddexp_onnx(x: Tensor, y: Tensor) -> Tensor:
     max_value = torch.max(x, y)
     diff = torch.abs(x - y)
@@ -210,6 +238,7 @@ class ScheduledFloat(torch.nn.Module):
             or not self.training
             or torch.jit.is_scripting()
             or torch.jit.is_tracing()
+            or _is_torch_compiling()
         ):
             return float(self.default)
         else:
@@ -874,7 +903,13 @@ class Balancer(torch.nn.Module):
         if (
             torch.jit.is_scripting()
             or not x.requires_grad
-            or (x.is_cuda and self.mem_cutoff(torch.cuda.memory_allocated()))
+            # Don't call torch.cuda.memory_allocated() under torch.compile:
+            # it's not traceable and (worse) the CutoffEstimator is stateful.
+            or (
+                x.is_cuda
+                and (not _is_torch_compiling())
+                and self.mem_cutoff(torch.cuda.memory_allocated())
+            )
         ):
             return _no_op(x)
 
