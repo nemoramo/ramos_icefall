@@ -392,6 +392,47 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--torch-compile",
+        type=str2bool,
+        default=False,
+        help="If True, wrap the model with torch.compile() (experimental).",
+    )
+
+    parser.add_argument(
+        "--torch-compile-backend",
+        type=str,
+        default="inductor",
+        help="Backend for torch.compile(). E.g., inductor, aot_eager, eager.",
+    )
+
+    parser.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default="default",
+        help=(
+            "Mode for torch.compile(). E.g., default, reduce-overhead, max-autotune, "
+            "max-autotune-no-cudagraphs."
+        ),
+    )
+
+    parser.add_argument(
+        "--torch-compile-dynamic",
+        type=str2bool,
+        default=True,
+        help=(
+            "If True, enable torch.compile(dynamic=True) to better handle variable "
+            "shapes (recommended for packing/on-the-fly training)."
+        ),
+    )
+
+    parser.add_argument(
+        "--torch-compile-fullgraph",
+        type=str2bool,
+        default=False,
+        help="If True, use torch.compile(fullgraph=True).",
+    )
+
+    parser.add_argument(
         "--decoder-dim",
         type=int,
         default=512,
@@ -2291,6 +2332,31 @@ def run(rank, world_size, args):
     )
 
     model.to(device)
+
+    if bool(getattr(params, "torch_compile", False)):
+        try:
+            backend = str(getattr(params, "torch_compile_backend", "inductor")).strip()
+            mode = str(getattr(params, "torch_compile_mode", "default")).strip()
+            dynamic = bool(getattr(params, "torch_compile_dynamic", True))
+            fullgraph = bool(getattr(params, "torch_compile_fullgraph", False))
+            logging.info(
+                "Enabling torch.compile: backend=%s mode=%s dynamic=%s fullgraph=%s",
+                backend,
+                mode,
+                dynamic,
+                fullgraph,
+            )
+            model = torch.compile(
+                model,
+                backend=backend,
+                mode=mode,
+                dynamic=dynamic,
+                fullgraph=fullgraph,
+            )
+            logging.info("torch.compile enabled")
+        except Exception as e:
+            logging.warning("torch.compile failed; continuing without it: %s", e)
+
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
