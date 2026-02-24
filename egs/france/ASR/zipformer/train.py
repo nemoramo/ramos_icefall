@@ -52,6 +52,7 @@ It supports training with:
 
 
 import argparse
+import contextlib
 import copy
 import logging
 import os
@@ -617,6 +618,97 @@ def get_parser():
         type=int,
         default=50,
         help="Print training stats every this many local batches.",
+    )
+
+    # Torch profiler (optional): useful to diagnose bubbles (e.g., dataloader stalls,
+    # DDP sync/all-reduce, unexpected CPU work). Profiling adds noticeable overhead,
+    # so keep the active window short.
+    parser.add_argument(
+        "--torch-profiler",
+        type=str2bool,
+        default=False,
+        help="Enable torch.profiler during training (best-effort).",
+    )
+    parser.add_argument(
+        "--torch-profiler-rank0-only",
+        type=str2bool,
+        default=True,
+        help="If True, enable profiler only on rank0 to reduce overhead/output.",
+    )
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        default="",
+        help="Output directory for profiler traces. If empty, use <exp_dir>/profiler.",
+    )
+    parser.add_argument(
+        "--torch-profiler-start-step",
+        type=int,
+        default=-1,
+        help=(
+            "Start profiling when global batch_idx_train reaches this value. "
+            "If <= 0, start on the next training step."
+        ),
+    )
+    parser.add_argument(
+        "--torch-profiler-wait",
+        type=int,
+        default=0,
+        help="Profiler schedule: number of steps to wait (no recording).",
+    )
+    parser.add_argument(
+        "--torch-profiler-warmup",
+        type=int,
+        default=5,
+        help="Profiler schedule: number of warmup steps (recording without trace export).",
+    )
+    parser.add_argument(
+        "--torch-profiler-active",
+        type=int,
+        default=20,
+        help="Profiler schedule: number of active steps (recording with trace export).",
+    )
+    parser.add_argument(
+        "--torch-profiler-repeat",
+        type=int,
+        default=1,
+        help="Profiler schedule: repeat count for (wait,warmup,active).",
+    )
+    parser.add_argument(
+        "--torch-profiler-record-shapes",
+        type=str2bool,
+        default=False,
+        help="If True, record tensor shapes (more overhead but easier attribution).",
+    )
+    parser.add_argument(
+        "--torch-profiler-profile-memory",
+        type=str2bool,
+        default=False,
+        help="If True, record memory usage (more overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-stack",
+        type=str2bool,
+        default=False,
+        help="If True, record Python stacks (very high overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-flops",
+        type=str2bool,
+        default=False,
+        help="If True, estimate FLOPs for some ops (extra overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-export-key-averages",
+        type=str2bool,
+        default=True,
+        help="If True, export a key_averages() table to <profiler_dir>/key_averages_rank{rank}.txt.",
+    )
+    parser.add_argument(
+        "--torch-profiler-row-limit",
+        type=int,
+        default=50,
+        help="Row limit when exporting key_averages() table.",
     )
 
     parser.add_argument(
@@ -1556,6 +1648,135 @@ def train_one_epoch(
 
     prev_step_end = time.perf_counter()
 
+    # Optional torch.profiler to diagnose bubbles (e.g., DDP sync/all-reduce, stalls).
+    # Best-effort: if torch.profiler is not available, training continues without it.
+    prof = None
+    prof_record_fn = None
+    prof_step_count = 0
+    prof_cfg = None
+    prof_start_step = None
+    prof_total_steps = None
+    prof_dir: Optional[Path] = None
+
+    def _prof_record(name: str):
+        if prof is None or prof_record_fn is None:
+            return contextlib.nullcontext()
+        return prof_record_fn(name)
+
+    def _stop_profiler(reason: str) -> None:
+        nonlocal prof, prof_record_fn, prof_step_count
+        if prof is None:
+            return
+        try:
+            prof.stop()
+        except Exception:
+            pass
+
+        if bool(getattr(params, "torch_profiler_export_key_averages", True)) and (
+            prof_dir is not None
+        ):
+            try:
+                sort_by = (
+                    "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
+                )
+                row_limit = int(getattr(params, "torch_profiler_row_limit", 50))
+                table = prof.key_averages().table(
+                    sort_by=sort_by, row_limit=row_limit
+                )
+                out = prof_dir / f"key_averages_rank{rank}.txt"
+                out.write_text(table + "\n", encoding="utf-8")
+                logging.info("Torch profiler key averages written to %s", out)
+            except Exception as e:
+                logging.warning("Failed to export torch profiler key averages: %s", e)
+
+        logging.info("Torch profiler stopped (%s).", reason)
+        prof = None
+        prof_record_fn = None
+        prof_step_count = 0
+
+    def _profiler_step_and_maybe_stop() -> None:
+        nonlocal prof_step_count
+        if prof is None:
+            return
+        try:
+            prof.step()
+        except Exception:
+            return
+        prof_step_count += 1
+        if prof_total_steps is not None and prof_step_count >= prof_total_steps:
+            _stop_profiler("reached configured steps")
+
+    if bool(getattr(params, "torch_profiler", False)) and (
+        (not bool(getattr(params, "torch_profiler_rank0_only", True))) or rank == 0
+    ):
+        try:
+            from torch.profiler import ProfilerActivity, profile as torch_profile
+            from torch.profiler import record_function as torch_record_function
+            from torch.profiler import schedule as torch_schedule
+            from torch.profiler import tensorboard_trace_handler
+        except Exception as e:
+            logging.warning("torch.profiler import failed; disabling profiler: %s", e)
+        else:
+            wait = int(getattr(params, "torch_profiler_wait", 0))
+            warmup = int(getattr(params, "torch_profiler_warmup", 5))
+            active = int(getattr(params, "torch_profiler_active", 20))
+            repeat = int(getattr(params, "torch_profiler_repeat", 1))
+            if wait < 0 or warmup < 0 or active <= 0 or repeat <= 0:
+                logging.warning(
+                    "Invalid torch profiler schedule (wait=%s warmup=%s active=%s repeat=%s); disabling profiler.",
+                    wait,
+                    warmup,
+                    active,
+                    repeat,
+                )
+            else:
+                start_step = int(getattr(params, "torch_profiler_start_step", -1))
+                if start_step <= 0:
+                    start_step = int(params.batch_idx_train) + 1
+                prof_start_step = start_step
+                prof_total_steps = (wait + warmup + active) * repeat
+
+                out_dir = str(getattr(params, "torch_profiler_dir", "")).strip()
+                prof_dir = Path(out_dir) if out_dir else (params.exp_dir / "profiler")
+                prof_dir.mkdir(parents=True, exist_ok=True)
+
+                activities = [ProfilerActivity.CPU]
+                if torch.cuda.is_available():
+                    activities.append(ProfilerActivity.CUDA)
+
+                prof_cfg = {
+                    "torch_profile": torch_profile,
+                    "record_fn": torch_record_function,
+                    "activities": activities,
+                    "schedule": torch_schedule(
+                        wait=wait, warmup=warmup, active=active, repeat=repeat
+                    ),
+                    "on_trace_ready": tensorboard_trace_handler(
+                        str(prof_dir), worker_name=f"rank{rank}"
+                    ),
+                    "record_shapes": bool(
+                        getattr(params, "torch_profiler_record_shapes", False)
+                    ),
+                    "profile_memory": bool(
+                        getattr(params, "torch_profiler_profile_memory", False)
+                    ),
+                    "with_stack": bool(
+                        getattr(params, "torch_profiler_with_stack", False)
+                    ),
+                    "with_flops": bool(
+                        getattr(params, "torch_profiler_with_flops", False)
+                    ),
+                }
+                logging.info(
+                    "Torch profiler enabled: start_step=%s schedule=(wait=%s,warmup=%s,active=%s,repeat=%s) dir=%s",
+                    prof_start_step,
+                    wait,
+                    warmup,
+                    active,
+                    repeat,
+                    prof_dir,
+                )
+
     for batch_idx, batch in enumerate(train_dl):
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
@@ -1565,30 +1786,62 @@ def train_one_epoch(
             set_batch_count(model, get_adjusted_batch_count(params))
 
         params.batch_idx_train += 1
+        if (
+            prof is None
+            and prof_cfg is not None
+            and prof_start_step is not None
+            and params.batch_idx_train == prof_start_step
+        ):
+            try:
+                prof = prof_cfg["torch_profile"](
+                    activities=prof_cfg["activities"],
+                    schedule=prof_cfg["schedule"],
+                    on_trace_ready=prof_cfg["on_trace_ready"],
+                    record_shapes=prof_cfg["record_shapes"],
+                    profile_memory=prof_cfg["profile_memory"],
+                    with_stack=prof_cfg["with_stack"],
+                    with_flops=prof_cfg["with_flops"],
+                )
+                prof.start()
+                prof_record_fn = prof_cfg["record_fn"]
+                prof_step_count = 0
+                logging.info(
+                    "Torch profiler started at global_step=%s; traces under %s",
+                    params.batch_idx_train,
+                    prof_dir,
+                )
+            except Exception as e:
+                logging.warning("Failed to start torch profiler; disabling: %s", e)
+                prof = None
+                prof_record_fn = None
+                prof_cfg = None
         batch_size = len(batch["supervisions"]["text"])
 
         try:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                )
+            with _prof_record("forward_loss"):
+                with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                    loss, loss_info = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=True,
+                    )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
-            scaler.scale(loss).backward()
+            with _prof_record("backward"):
+                scaler.scale(loss).backward()
             scheduler.step_batch(params.batch_idx_train)
 
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+            with _prof_record("optimizer_step"):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         except Exception as e:
@@ -1610,6 +1863,7 @@ def train_one_epoch(
                     torch.cuda.empty_cache()
                 # Do not count a skipped OOM batch as an optimization step.
                 params.batch_idx_train -= 1
+                _profiler_step_and_maybe_stop()
                 continue
 
             logging.info(f"Caught exception: {e}.")
@@ -1618,6 +1872,7 @@ def train_one_epoch(
             raise
 
         if params.print_diagnostics and batch_idx == 5:
+            _stop_profiler("print_diagnostics early-exit")
             return False
 
         if (
@@ -1884,6 +2139,7 @@ def train_one_epoch(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
                     )
 
+        _profiler_step_and_maybe_stop()
         prev_step_end = time.perf_counter()
         if (
             params.batch_idx_train > 0
@@ -1924,6 +2180,9 @@ def train_one_epoch(
                 f"Reached max_train_steps={params.max_train_steps}; stopping training loop."
             )
             break
+
+    if prof is not None:
+        _stop_profiler("epoch_end")
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
