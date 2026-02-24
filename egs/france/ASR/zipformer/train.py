@@ -170,6 +170,34 @@ def _query_nvidia_smi() -> Optional[Dict[int, Dict[str, float]]]:
     return stats or None
 
 
+def _compute_feature_lens_list(
+    supervisions: Dict[str, Any], num_seqs: int
+) -> List[int]:
+    """Compute per-sequence frame lengths from K2SpeechRecognitionDataset supervisions.
+
+    This works for both the standard case (one supervision per sequence) and the
+    CutConcatenate packing case (multiple supervisions per sequence).
+    """
+    if num_seqs <= 0:
+        return []
+
+    seq_idx = supervisions["sequence_idx"]
+    start_frame = supervisions["start_frame"]
+    num_frames = supervisions["num_frames"]
+    if isinstance(seq_idx, torch.Tensor):
+        seq_idx = seq_idx.detach().cpu().tolist()
+        start_frame = start_frame.detach().cpu().tolist()
+        num_frames = num_frames.detach().cpu().tolist()
+
+    lens = [0] * num_seqs
+    for b, st, nf in zip(seq_idx, start_frame, num_frames):
+        b = int(b)
+        end = int(st) + int(nf)
+        if end > lens[b]:
+            lens[b] = end
+    return lens
+
+
 def get_adjusted_batch_count(params: AttributeDict) -> float:
     # returns the number of batches we would have used so far if we had used the reference
     # duration.  This is for purposes of set_batch_count().
@@ -1155,22 +1183,8 @@ def compute_loss(
     # Compute per-sequence lengths. This is required when CutConcatenate packing is used
     # (multiple supervisions per sequence), and is equivalent to num_frames in the
     # non-packed case.
-    seq_idx = supervisions["sequence_idx"]
-    start_frame = supervisions["start_frame"]
-    num_frames = supervisions["num_frames"]
-    if isinstance(seq_idx, torch.Tensor):
-        seq_idx = seq_idx.detach().cpu().tolist()
-        start_frame = start_frame.detach().cpu().tolist()
-        num_frames = num_frames.detach().cpu().tolist()
-
     num_seqs = feature.size(0)
-    feature_lens_list = [0] * num_seqs
-    for b, st, nf in zip(seq_idx, start_frame, num_frames):
-        b = int(b)
-        end = int(st) + int(nf)
-        if end > feature_lens_list[b]:
-            feature_lens_list[b] = end
-
+    feature_lens_list = _compute_feature_lens_list(supervisions, num_seqs=num_seqs)
     feature_lens = torch.tensor(feature_lens_list, device=device, dtype=torch.int64)
 
     batch_idx_train = params.batch_idx_train
@@ -1698,6 +1712,117 @@ def train_one_epoch(
                 f"gmem={gpu_mem_alloc_mb:.1f}/{gpu_mem_reserved_mb:.1f}MB, "
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
+
+            # Per-rank batch shape stats to help diagnose DDP imbalance.
+            try:
+                inputs = batch.get("inputs")
+                if isinstance(inputs, torch.Tensor) and inputs.ndim == 3:
+                    nseq, t, c = inputs.shape
+                else:
+                    nseq, t, c = 0, 0, 0
+
+                supervisions = batch.get("supervisions", {})
+                lens_list = _compute_feature_lens_list(supervisions, num_seqs=nseq)
+                lens_max = max(lens_list) if lens_list else 0
+                lens_sum = sum(lens_list) if lens_list else 0
+                n_sup = len(supervisions.get("text", []))
+
+                use_packed = bool(getattr(params, "use_packed_supervisions", False))
+                mask_t = 0
+                if use_packed and bool(getattr(params, "pack_attn_mask", False)):
+                    # Conv2dSubsampling reduces length as: (T - 7) // 2
+                    mask_t = max(0, (int(lens_max) - 7) // 2)
+
+                if world_size > 1 and dist.is_initialized():
+                    backend = dist.get_backend()
+                    use_cuda_gather = torch.cuda.is_available() and backend == "nccl"
+                    dev = (
+                        next(model.parameters()).device
+                        if use_cuda_gather
+                        else torch.device("cpu")
+                    )
+                    stats = torch.tensor(
+                        [nseq, t, c, n_sup, lens_max, lens_sum, mask_t],
+                        device=dev,
+                        dtype=torch.int64,
+                    )
+                    gathered = [torch.empty_like(stats) for _ in range(world_size)]
+                    dist.all_gather(gathered, stats)
+
+                    if rank == 0:
+                        parts: List[str] = []
+                        for r, g in enumerate(gathered):
+                            (
+                                nseq_r,
+                                t_r,
+                                c_r,
+                                n_sup_r,
+                                lens_max_r,
+                                lens_sum_r,
+                                mask_t_r,
+                            ) = g.tolist()
+                            parts.append(
+                                f"r{r}:x=({nseq_r},{t_r},{c_r}) "
+                                f"lens_max={lens_max_r} lens_sum={lens_sum_r} "
+                                f"sup={n_sup_r} mask_t={mask_t_r}"
+                            )
+                        logging.info("Per-rank batch shape: " + " | ".join(parts))
+
+                        if tb_writer is not None:
+                            for r, g in enumerate(gathered):
+                                (
+                                    nseq_r,
+                                    t_r,
+                                    _c_r,
+                                    n_sup_r,
+                                    lens_max_r,
+                                    lens_sum_r,
+                                    mask_t_r,
+                                ) = g.tolist()
+                                tb_writer.add_scalar(
+                                    f"train/batch_nseq_rank{r}",
+                                    nseq_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_T_rank{r}",
+                                    t_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_sup_rank{r}",
+                                    n_sup_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_lens_max_rank{r}",
+                                    lens_max_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_lens_sum_rank{r}",
+                                    lens_sum_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_pack_mask_t_rank{r}",
+                                    mask_t_r,
+                                    params.batch_idx_train,
+                                )
+                else:
+                    logging.info(
+                        "Batch shape: x=(%s,%s,%s) lens_max=%s lens_sum=%s sup=%s mask_t=%s",
+                        nseq,
+                        t,
+                        c,
+                        lens_max,
+                        lens_sum,
+                        n_sup,
+                        mask_t,
+                    )
+            except Exception:
+                # Keep training robust; shape stats are best-effort.
+                pass
 
             if tb_writer is not None:
                 tb_writer.add_scalar(
