@@ -382,16 +382,6 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--use-flex-attention",
-        type=str2bool,
-        default=False,
-        help=(
-            "If True, use torch.nn.attention.flex_attention in the Zipformer2 encoder "
-            "for attention computation (experimental)."
-        ),
-    )
-
-    parser.add_argument(
         "--decoder-dim",
         type=int,
         default=512,
@@ -1044,7 +1034,6 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         causal=params.causal,
         chunk_size=_to_int_tuple(params.chunk_size),
         left_context_frames=_to_int_tuple(params.left_context_frames),
-        use_flex_attention=bool(getattr(params, "use_flex_attention", False)),
     )
     return encoder
 
