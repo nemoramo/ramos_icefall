@@ -10,16 +10,11 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 export PYTHONPATH="${ICEFALL_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TMPDIR="${TMPDIR:-${DATA_ROOT}/tmp}"
-# Avoid writing large caches to $HOME (e.g., torch.compile/inductor/triton).
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DATA_ROOT}/.cache}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${XDG_CACHE_HOME}/torch/inductor}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${XDG_CACHE_HOME}/triton}"
 # NCCL defaults for single-node run without IB.
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 mkdir -p "${TMPDIR}"
-mkdir -p "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
 
 MANIFEST_DIR="${MANIFEST_DIR:-${DATA_ROOT}/data/french/manifests}"
 TRAIN_CUTS_FILENAME="${TRAIN_CUTS_FILENAME:-msr_cuts_French_train.jsonl.gz}"
@@ -76,23 +71,6 @@ COMPUTE_VALID_WER="${COMPUTE_VALID_WER:-1}"
 VALID_WER_MAX_BATCHES="${VALID_WER_MAX_BATCHES:-100}"
 WER_LOWERCASE="${WER_LOWERCASE:-1}"
 
-# Packing (CutConcatenate) options.
-CONCATENATE_CUTS="${CONCATENATE_CUTS:-1}"
-VALID_CONCATENATE_CUTS="${VALID_CONCATENATE_CUTS:-0}"
-CONCATENATE_CUTS_MAX_DURATION="${CONCATENATE_CUTS_MAX_DURATION:-30}"
-DURATION_FACTOR="${DURATION_FACTOR:-1.0}"
-GAP="${GAP:-1.0}"
-DDP_PACK_SAMPLER="${DDP_PACK_SAMPLER:-1}"
-USE_PACKED_SUPERVISIONS="${USE_PACKED_SUPERVISIONS:-1}"
-PACK_ATTN_MASK="${PACK_ATTN_MASK:-1}"
-
-# torch.compile (optional).
-TORCH_COMPILE="${TORCH_COMPILE:-0}"
-TORCH_COMPILE_BACKEND="${TORCH_COMPILE_BACKEND:-inductor}"
-TORCH_COMPILE_MODE="${TORCH_COMPILE_MODE:-default}"
-TORCH_COMPILE_DYNAMIC="${TORCH_COMPILE_DYNAMIC:-1}"
-TORCH_COMPILE_FULLGRAPH="${TORCH_COMPILE_FULLGRAPH:-0}"
-
 python ./zipformer/train.py \
   --world-size "${WORLD_SIZE}" \
   --dist-backend "${DIST_BACKEND}" \
@@ -119,19 +97,6 @@ python ./zipformer/train.py \
   --enable-spec-aug 1 \
   --enable-musan "${ENABLE_MUSAN}" \
   --on-the-fly-feats True \
-  --concatenate-cuts "${CONCATENATE_CUTS}" \
-  --valid-concatenate-cuts "${VALID_CONCATENATE_CUTS}" \
-  --concatenate-cuts-max-duration "${CONCATENATE_CUTS_MAX_DURATION}" \
-  --duration-factor "${DURATION_FACTOR}" \
-  --gap "${GAP}" \
-  --ddp-pack-sampler "${DDP_PACK_SAMPLER}" \
-  --use-packed-supervisions "${USE_PACKED_SUPERVISIONS}" \
-  --pack-attn-mask "${PACK_ATTN_MASK}" \
-  --torch-compile "${TORCH_COMPILE}" \
-  --torch-compile-backend "${TORCH_COMPILE_BACKEND}" \
-  --torch-compile-mode "${TORCH_COMPILE_MODE}" \
-  --torch-compile-dynamic "${TORCH_COMPILE_DYNAMIC}" \
-  --torch-compile-fullgraph "${TORCH_COMPILE_FULLGRAPH}" \
   --skip-oom-scan "${SKIP_OOM_SCAN}" \
   --skip-oom-batch "${SKIP_OOM_BATCH}" \
   --filter-cuts "${FILTER_CUTS}" \
