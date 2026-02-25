@@ -912,7 +912,11 @@ class Zipformer2EncoderLayer(nn.Module):
             selected_attn_weights = attn_weights0.unsqueeze(0)
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             pass
-        elif self.training and random.random() < float(self.const_attention_rate):
+        elif (
+            (not torch.compiler.is_dynamo_compiling())
+            and self.training
+            and random.random() < float(self.const_attention_rate)
+        ):
             # Make attention weights constant.  The intention is to
             # encourage these modules to do something similar to an
             # averaging-over-time operation.
@@ -1982,6 +1986,10 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         use_pos_scores = False
         if torch.jit.is_scripting() or torch.jit.is_tracing():
+            use_pos_scores = True
+        elif torch.compiler.is_dynamo_compiling():
+            # Avoid Python RNG under torch.compile. We keep positional scores enabled
+            # (i.e., disable pos-emb skipping) to make the graph traceable.
             use_pos_scores = True
         elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
             use_pos_scores = True
