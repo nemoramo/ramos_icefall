@@ -1970,6 +1970,16 @@ def train_one_epoch(
                 lens_max = max(lens_list) if lens_list else 0
                 lens_sum = sum(lens_list) if lens_list else 0
                 n_sup = len(supervisions.get("text", []))
+                speech_frames = 0
+                num_frames = supervisions.get("num_frames", None)
+                if isinstance(num_frames, torch.Tensor):
+                    speech_frames = int(num_frames.detach().sum().item())
+                elif num_frames is not None:
+                    try:
+                        speech_frames = int(sum(int(x) for x in num_frames))
+                    except Exception:
+                        speech_frames = 0
+                total_frames = int(nseq) * int(t)
 
                 use_packed = bool(getattr(params, "use_packed_supervisions", False))
                 mask_t = 0
@@ -1986,7 +1996,17 @@ def train_one_epoch(
                         else torch.device("cpu")
                     )
                     stats = torch.tensor(
-                        [nseq, t, c, n_sup, lens_max, lens_sum, mask_t],
+                        [
+                            nseq,
+                            t,
+                            c,
+                            n_sup,
+                            lens_max,
+                            lens_sum,
+                            mask_t,
+                            speech_frames,
+                            total_frames,
+                        ],
                         device=dev,
                         dtype=torch.int64,
                     )
@@ -2004,11 +2024,25 @@ def train_one_epoch(
                                 lens_max_r,
                                 lens_sum_r,
                                 mask_t_r,
+                                speech_frames_r,
+                                total_frames_r,
                             ) = g.tolist()
+                            nonpad_ratio_r = (
+                                float(lens_sum_r) / float(total_frames_r)
+                                if total_frames_r > 0
+                                else 0.0
+                            )
+                            speech_ratio_r = (
+                                float(speech_frames_r) / float(total_frames_r)
+                                if total_frames_r > 0
+                                else 0.0
+                            )
                             parts.append(
                                 f"r{r}:x=({nseq_r},{t_r},{c_r}) "
                                 f"lens_max={lens_max_r} lens_sum={lens_sum_r} "
-                                f"sup={n_sup_r} mask_t={mask_t_r}"
+                                f"sup={n_sup_r} mask_t={mask_t_r} "
+                                f"nonpad_ratio={nonpad_ratio_r:.3f} "
+                                f"speech_ratio={speech_ratio_r:.3f}"
                             )
                         logging.info("Per-rank batch shape: " + " | ".join(parts))
 
@@ -2022,7 +2056,19 @@ def train_one_epoch(
                                     lens_max_r,
                                     lens_sum_r,
                                     mask_t_r,
+                                    speech_frames_r,
+                                    total_frames_r,
                                 ) = g.tolist()
+                                nonpad_ratio_r = (
+                                    float(lens_sum_r) / float(total_frames_r)
+                                    if total_frames_r > 0
+                                    else 0.0
+                                )
+                                speech_ratio_r = (
+                                    float(speech_frames_r) / float(total_frames_r)
+                                    if total_frames_r > 0
+                                    else 0.0
+                                )
                                 tb_writer.add_scalar(
                                     f"train/batch_nseq_rank{r}",
                                     nseq_r,
@@ -2053,9 +2099,28 @@ def train_one_epoch(
                                     mask_t_r,
                                     params.batch_idx_train,
                                 )
+                                tb_writer.add_scalar(
+                                    f"train/batch_nonpad_ratio_rank{r}",
+                                    nonpad_ratio_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_speech_ratio_rank{r}",
+                                    speech_ratio_r,
+                                    params.batch_idx_train,
+                                )
                 else:
+                    nonpad_ratio = (
+                        float(lens_sum) / float(total_frames) if total_frames > 0 else 0.0
+                    )
+                    speech_ratio = (
+                        float(speech_frames) / float(total_frames)
+                        if total_frames > 0
+                        else 0.0
+                    )
                     logging.info(
-                        "Batch shape: x=(%s,%s,%s) lens_max=%s lens_sum=%s sup=%s mask_t=%s",
+                        "Batch shape: x=(%s,%s,%s) lens_max=%s lens_sum=%s sup=%s mask_t=%s "
+                        "nonpad_ratio=%.3f speech_ratio=%.3f",
                         nseq,
                         t,
                         c,
@@ -2063,6 +2128,8 @@ def train_one_epoch(
                         lens_sum,
                         n_sup,
                         mask_t,
+                        nonpad_ratio,
+                        speech_ratio,
                     )
             except Exception:
                 # Keep training robust; shape stats are best-effort.

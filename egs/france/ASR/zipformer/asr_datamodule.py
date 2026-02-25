@@ -179,6 +179,69 @@ class MSR_AsrDataModule:
             ),
         )
         group.add_argument(
+            "--pack-fill-strategy",
+            type=str,
+            default="legacy",
+            help=(
+                "Packing strategy used by --ddp-pack-sampler. "
+                "Options: legacy, raw_best_fit, raw_best_fit_knapsack."
+            ),
+        )
+        group.add_argument(
+            "--pack-raw-pool-size",
+            type=int,
+            default=0,
+            help=(
+                "Target raw-cut pool size used by raw_best_fit packing. "
+                "Set <= 0 to use sampler defaults."
+            ),
+        )
+        group.add_argument(
+            "--pack-max-pieces-per-bin",
+            type=int,
+            default=0,
+            help=(
+                "Maximum number of raw cuts allowed in one packed bin for raw_best_fit. "
+                "Set <= 0 to disable."
+            ),
+        )
+        group.add_argument(
+            "--pack-min-remaining-duration",
+            type=float,
+            default=0.5,
+            help=(
+                "Stop filling a raw_best_fit bin when remaining duration (seconds) "
+                "is below this threshold."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-rem",
+            type=float,
+            default=5.0,
+            help=(
+                "For raw_best_fit_knapsack: apply tail knapsack when remaining "
+                "duration (seconds) is <= this threshold."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-max-candidates",
+            type=int,
+            default=128,
+            help=(
+                "For raw_best_fit_knapsack: max short-cut candidates considered "
+                "in tail knapsack per bin."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-max-pieces",
+            type=int,
+            default=4,
+            help=(
+                "For raw_best_fit_knapsack: max additional pieces selected by "
+                "tail knapsack per bin."
+            ),
+        )
+        group.add_argument(
             "--valid-concatenate-cuts",
             type=str2bool,
             default=False,
@@ -473,6 +536,27 @@ class MSR_AsrDataModule:
                     gap=float(self.args.gap),
                     duration_factor=float(self.args.duration_factor),
                     pack_max_duration=pack_max_dur if pack_max_dur > 0 else None,
+                    pack_fill_strategy=str(
+                        getattr(self.args, "pack_fill_strategy", "legacy")
+                    ),
+                    pack_raw_pool_size=int(
+                        getattr(self.args, "pack_raw_pool_size", 0)
+                    ),
+                    pack_max_pieces_per_bin=int(
+                        getattr(self.args, "pack_max_pieces_per_bin", 0)
+                    ),
+                    pack_min_remaining_duration=float(
+                        getattr(self.args, "pack_min_remaining_duration", 0.5)
+                    ),
+                    pack_tail_knapsack_rem=float(
+                        getattr(self.args, "pack_tail_knapsack_rem", 5.0)
+                    ),
+                    pack_tail_knapsack_max_candidates=int(
+                        getattr(self.args, "pack_tail_knapsack_max_candidates", 128)
+                    ),
+                    pack_tail_knapsack_max_pieces=int(
+                        getattr(self.args, "pack_tail_knapsack_max_pieces", 4)
+                    ),
                 )
             elif getattr(self.args, "world_size", 1) > 1:
                 sampler_kwargs.update(

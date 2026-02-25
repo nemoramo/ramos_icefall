@@ -34,6 +34,7 @@ The key is that the split happens after packing, so ranks see similar compute.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -128,6 +129,13 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
         gap: float = 1.0,
         duration_factor: float = 1.0,
         pack_max_duration: Optional[float] = None,
+        pack_fill_strategy: str = "legacy",
+        pack_raw_pool_size: int = 0,
+        pack_max_pieces_per_bin: int = 0,
+        pack_min_remaining_duration: float = 0.5,
+        pack_tail_knapsack_rem: float = 5.0,
+        pack_tail_knapsack_max_candidates: int = 128,
+        pack_tail_knapsack_max_pieces: int = 4,
     ) -> None:
         super().__init__(
             shuffle=shuffle,
@@ -154,17 +162,67 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
             else None
         )
 
+        self.pack_gap = float(gap)
+        self.pack_max_duration = (
+            float(pack_max_duration)
+            if pack_max_duration is not None and float(pack_max_duration) > 0
+            else None
+        )
+        self.pack_fill_strategy = str(pack_fill_strategy).strip().lower()
+        if self.pack_fill_strategy not in (
+            "legacy",
+            "raw_best_fit",
+            "raw_best_fit_knapsack",
+        ):
+            logging.warning(
+                "Unknown pack_fill_strategy=%s; falling back to legacy.",
+                self.pack_fill_strategy,
+            )
+            self.pack_fill_strategy = "legacy"
+        self.pack_raw_pool_size = max(0, int(pack_raw_pool_size))
+        self.pack_max_pieces_per_bin = (
+            int(pack_max_pieces_per_bin)
+            if int(pack_max_pieces_per_bin) > 0
+            else None
+        )
+        self.pack_min_remaining_duration = max(0.0, float(pack_min_remaining_duration))
+        self.pack_tail_knapsack_rem = max(0.0, float(pack_tail_knapsack_rem))
+        self.pack_tail_knapsack_max_candidates = max(
+            8, int(pack_tail_knapsack_max_candidates)
+        )
+        self.pack_tail_knapsack_max_pieces = max(1, int(pack_tail_knapsack_max_pieces))
+        # Resolution: 0.1s per knapsack step.
+        self.pack_knapsack_unit = 10.0
+
         self.packer = CutConcatenate(
             gap=float(gap),
             duration_factor=float(duration_factor),
-            max_duration=float(pack_max_duration)
-            if pack_max_duration is not None and float(pack_max_duration) > 0
-            else None,
+            max_duration=self.pack_max_duration,
         )
+
+        if self.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack"):
+            if self.pack_max_duration is None:
+                logging.warning(
+                    "%s requires pack_max_duration > 0; falling back to legacy.",
+                    self.pack_fill_strategy,
+                )
+                self.pack_fill_strategy = "legacy"
+            elif not self.max_cuts_per_rank or int(self.max_cuts_per_rank) <= 0:
+                logging.warning(
+                    "%s requires max_cuts > 0 for stable per-step shape; "
+                    "falling back to legacy."
+                    % self.pack_fill_strategy
+                )
+                self.pack_fill_strategy = "legacy"
 
         self._legacy_mega_batch_mode = False
         self._legacy_mega_max_duration = None
         self._legacy_mega_max_cuts = None
+        # Runtime pools for raw_best_fit mode.
+        # NOTE: We keep these as ephemeral runtime state and do not serialize the
+        # full pool content in checkpoints.
+        self._raw_pool: List[Any] = []
+        self._packed_pool: List[Any] = []
 
         inner_kwargs: Dict[str, Any] = dict(
             max_duration=self.max_duration_per_rank,
@@ -188,13 +246,24 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
 
         logging.info(
             "PackAwareDistributedDynamicBucketingSampler: world_size=%s rank=%s "
-            "max_duration_per_rank=%.1f pack_max_duration=%s gap=%.2f quadratic_duration=%s",
+            "max_duration_per_rank=%.1f pack_max_duration=%s gap=%.2f quadratic_duration=%s "
+            "pack_fill_strategy=%s pack_raw_pool_size=%s pack_max_pieces_per_bin=%s "
+            "pack_min_remaining_duration=%.3f "
+            "pack_tail_knapsack_rem=%.3f pack_tail_knapsack_max_candidates=%s "
+            "pack_tail_knapsack_max_pieces=%s",
             self.world_size,
             self.rank,
             self.max_duration_per_rank,
             pack_max_duration if pack_max_duration and pack_max_duration > 0 else None,
             gap,
             self.quadratic_duration,
+            self.pack_fill_strategy,
+            self.pack_raw_pool_size,
+            self.pack_max_pieces_per_bin,
+            self.pack_min_remaining_duration,
+            self.pack_tail_knapsack_rem,
+            self.pack_tail_knapsack_max_candidates,
+            self.pack_tail_knapsack_max_pieces,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -210,6 +279,13 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
                 "max_cuts_per_rank": self.max_cuts_per_rank,
                 "quadratic_duration": self.quadratic_duration,
                 "pack_mode": "legacy_mega_batch" if self._legacy_mega_batch_mode else "grouped_batches",
+                "pack_fill_strategy": self.pack_fill_strategy,
+                "pack_raw_pool_size": self.pack_raw_pool_size,
+                "pack_max_pieces_per_bin": self.pack_max_pieces_per_bin,
+                "pack_min_remaining_duration": self.pack_min_remaining_duration,
+                "pack_tail_knapsack_rem": self.pack_tail_knapsack_rem,
+                "pack_tail_knapsack_max_candidates": self.pack_tail_knapsack_max_candidates,
+                "pack_tail_knapsack_max_pieces": self.pack_tail_knapsack_max_pieces,
                 "inner": self.inner.state_dict(),
             }
         )
@@ -221,6 +297,13 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
         sd.pop("max_duration_per_rank", None)
         sd.pop("max_cuts_per_rank", None)
         sd.pop("quadratic_duration", None)
+        sd.pop("pack_fill_strategy", None)
+        sd.pop("pack_raw_pool_size", None)
+        sd.pop("pack_max_pieces_per_bin", None)
+        sd.pop("pack_min_remaining_duration", None)
+        sd.pop("pack_tail_knapsack_rem", None)
+        sd.pop("pack_tail_knapsack_max_candidates", None)
+        sd.pop("pack_tail_knapsack_max_pieces", None)
         pack_mode = sd.pop("pack_mode", None)
         legacy_mega_max_duration = sd.pop("mega_max_duration", None)
         legacy_mega_max_cuts = sd.pop("mega_max_cuts", None)
@@ -269,11 +352,242 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
 
         self.inner.load_state_dict(inner_sd)
         self._inner_iter = iter(self.inner)
+        self._raw_pool = []
+        self._packed_pool = []
 
     def __iter__(self) -> "PackAwareDistributedDynamicBucketingSampler":
         # Always initialize inner iterator; when restored, inner.__iter__ is a no-op.
         self._inner_iter = iter(self.inner)
+        self._raw_pool = []
+        self._packed_pool = []
         return self
+
+    def _target_total_packed_cuts(self) -> int:
+        # raw_best_fit is enabled only when max_cuts_per_rank > 0.
+        return int(self.world_size) * int(self.max_cuts_per_rank)
+
+    def _raw_pool_target_size(self) -> int:
+        if self.pack_raw_pool_size > 0:
+            return max(self.pack_raw_pool_size, int(self.world_size))
+        # Default prefetch target: several outer-step packed bins worth of raw cuts.
+        return max(self._target_total_packed_cuts() * 4, int(self.world_size) * 32)
+
+    def _fill_raw_pool(self, min_items: int) -> None:
+        assert self._inner_iter is not None
+        while len(self._raw_pool) < max(1, int(min_items)):
+            raw = next(self._inner_iter)  # may raise StopIteration
+            self._raw_pool.extend(list(raw))
+
+    def _select_tail_knapsack_indices(
+        self,
+        durs: List[float],
+        *,
+        avail: float,
+        max_additional_pieces: int,
+    ) -> List[int]:
+        if (
+            avail <= 0
+            or max_additional_pieces <= 0
+            or self.pack_tail_knapsack_max_candidates <= 0
+        ):
+            return []
+
+        cap = int(avail * self.pack_knapsack_unit + 1e-6)
+        if cap <= 0:
+            return []
+
+        max_idx = bisect_right(durs, avail) - 1
+        if max_idx < 0:
+            return []
+
+        start = max(0, max_idx + 1 - int(self.pack_tail_knapsack_max_candidates))
+        cand_global = list(range(start, max_idx + 1))
+        items: List[tuple] = []
+        for gidx in cand_global:
+            d = float(durs[gidx])
+            cost = int((d + self.pack_gap) * self.pack_knapsack_unit + 1e-6)
+            if 0 < cost <= cap:
+                items.append((gidx, cost))
+        if not items:
+            return []
+
+        max_k = min(
+            int(max_additional_pieces),
+            int(self.pack_tail_knapsack_max_pieces),
+            len(items),
+        )
+        if max_k <= 0:
+            return []
+
+        dp = [[-1] * (cap + 1) for _ in range(max_k + 1)]
+        prev: List[List[Optional[tuple]]] = [
+            [None] * (cap + 1) for _ in range(max_k + 1)
+        ]
+        dp[0][0] = 0
+
+        for pos, (_gidx, cost) in enumerate(items):
+            for k in range(max_k, 0, -1):
+                for c in range(cap, cost - 1, -1):
+                    if dp[k - 1][c - cost] < 0:
+                        continue
+                    cand = dp[k - 1][c - cost] + cost
+                    if cand > dp[k][c]:
+                        dp[k][c] = cand
+                        prev[k][c] = (k - 1, c - cost, pos)
+
+        best_score = -1
+        best_k = 0
+        best_c = 0
+        for k in range(1, max_k + 1):
+            for c in range(cap, -1, -1):
+                if dp[k][c] < 0:
+                    continue
+                if dp[k][c] > best_score:
+                    best_score = dp[k][c]
+                    best_k = k
+                    best_c = c
+                break
+
+        if best_score <= 0:
+            return []
+
+        selected: List[int] = []
+        k = best_k
+        c = best_c
+        while k > 0:
+            p = prev[k][c]
+            if p is None:
+                break
+            pk, pc, pos = p
+            selected.append(items[pos][0])
+            k, c = pk, pc
+        selected.sort()
+        return selected
+
+    def _pack_from_raw_pool_best_fit(self, max_bins: int) -> List[Any]:
+        if max_bins <= 0 or len(self._raw_pool) == 0:
+            return []
+        if self.pack_max_duration is None:
+            return []
+
+        entries = sorted(
+            (
+                max(0.0, float(getattr(c, "duration", 0.0))),
+                i,
+                c,
+            )
+            for i, c in enumerate(self._raw_pool)
+        )
+        durs: List[float] = [d for d, _, _ in entries]
+        cuts: List[Any] = [c for _, _, c in entries]
+        packed_out: List[Any] = []
+
+        built_bins = 0
+        while cuts and built_bins < int(max_bins):
+            # Anchor with the longest duration.
+            anchor_cut = cuts.pop()
+            anchor_dur = durs.pop()
+            bin_cuts: List[Any] = [anchor_cut]
+            used = max(0.0, float(anchor_dur))
+            pieces = 1
+
+            while cuts:
+                if (
+                    self.pack_max_pieces_per_bin is not None
+                    and pieces >= self.pack_max_pieces_per_bin
+                ):
+                    break
+                rem = float(self.pack_max_duration) - used
+                if rem <= self.pack_min_remaining_duration:
+                    break
+                # Adding a new piece also adds one gap.
+                avail = rem - self.pack_gap
+                if avail <= 0:
+                    break
+
+                if (
+                    self.pack_fill_strategy == "raw_best_fit_knapsack"
+                    and rem <= self.pack_tail_knapsack_rem
+                ):
+                    max_additional_pieces = (
+                        (
+                            int(self.pack_max_pieces_per_bin) - int(pieces)
+                            if self.pack_max_pieces_per_bin is not None
+                            else int(self.pack_tail_knapsack_max_pieces)
+                        )
+                    )
+                    sel = self._select_tail_knapsack_indices(
+                        durs,
+                        avail=avail,
+                        max_additional_pieces=max_additional_pieces,
+                    )
+                    if sel:
+                        for sidx in reversed(sel):
+                            c = cuts.pop(sidx)
+                            d = durs.pop(sidx)
+                            bin_cuts.append(c)
+                            used += self.pack_gap + max(0.0, float(d))
+                            pieces += 1
+                        continue
+
+                idx = bisect_right(durs, avail) - 1
+                if idx < 0:
+                    break
+
+                c = cuts.pop(idx)
+                d = durs.pop(idx)
+                bin_cuts.append(c)
+                used += self.pack_gap + max(0.0, float(d))
+                pieces += 1
+
+            packed_bin = self.packer(CutSet.from_cuts(bin_cuts))
+            packed_out.extend(list(packed_bin))
+            built_bins += 1
+
+        self._raw_pool = cuts
+        return packed_out
+
+    def _next_raw_best_fit(self) -> CutSet:
+        target_total = self._target_total_packed_cuts()
+        pool_target = self._raw_pool_target_size()
+
+        # Keep producing packed cuts until we have enough for one full DDP split.
+        while len(self._packed_pool) < target_total:
+            try:
+                self._fill_raw_pool(pool_target)
+            except StopIteration:
+                # No more new raw cuts; try to drain what remains in the pool.
+                if len(self._raw_pool) == 0:
+                    break
+
+            need_bins = max(1, target_total - len(self._packed_pool))
+            new_packed = self._pack_from_raw_pool_best_fit(need_bins)
+            if len(new_packed) == 0:
+                # Safety fallback: consume one inner raw batch and use regular pack.
+                try:
+                    assert self._inner_iter is not None
+                    raw = next(self._inner_iter)
+                    self._packed_pool.extend(list(self.packer(raw)))
+                except StopIteration:
+                    break
+            else:
+                self._packed_pool.extend(new_packed)
+
+        if len(self._packed_pool) < int(self.world_size):
+            raise StopIteration
+        if bool(self.drop_last) and len(self._packed_pool) < target_total:
+            raise StopIteration
+
+        take_n = target_total if len(self._packed_pool) >= target_total else len(self._packed_pool)
+        packed = CutSet.from_cuts(self._packed_pool[:take_n])
+        self._packed_pool = self._packed_pool[take_n:]
+
+        splits = _split_packed_cuts_by_count_and_sum_dur(
+            packed,
+            world_size=int(self.world_size),
+            quadratic_duration=self.quadratic_duration,
+        )
+        return splits[int(self.rank)]
 
     def __next__(self) -> CutSet:
         if self._inner_iter is None:
@@ -288,6 +602,8 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
                 quadratic_duration=self.quadratic_duration,
             )
             selected = splits[int(self.rank)]
+        elif self.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack"):
+            selected = self._next_raw_best_fit()
         else:
             # Build a deterministic mega-batch by taking world_size successive inner batches.
             raw_batches: List[CutSet] = []
