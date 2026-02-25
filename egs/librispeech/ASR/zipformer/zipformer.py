@@ -953,20 +953,79 @@ class Zipformer2EncoderLayer(nn.Module):
             has_kpm = src_key_padding_mask is not None
 
             def score_mod(score, b, h, q_idx, k_idx):
+                # NOTE: When torch.compile is enabled, FlexAttention may call score_mod
+                # with 0-d (fake) tensors as indices. Avoid Python indexing with such
+                # indices (it triggers Tensor.__index__ -> .item() -> _local_scalar_dense).
+
+                def _as_i64_index(x):
+                    if torch.is_tensor(x):
+                        return x.to(dtype=torch.int64)
+                    # Use score.new_tensor() so the index lives on the same (fake) device.
+                    return score.new_tensor(x, dtype=torch.int64)
+
+                b_i = _as_i64_index(b)
+                h_i = _as_i64_index(h)
+                q_i = _as_i64_index(q_idx)
+                k_i = _as_i64_index(k_idx)
+
                 if use_pos:
-                    rel = (seq_len - 1) + k_idx - q_idx
-                    for d in range(pos_head_dim):
-                        score = score + p[b, h, q_idx, d] * pos_emb_proj[b, h, rel, d]
+                    assert pos_emb_proj is not None
+                    rel = (seq_len - 1) + k_i - q_i
+                    # Gather p[b,h,q,:] and pos_emb_proj[b,h,rel,:] without Python indexing.
+                    p_b = p.gather(
+                        0,
+                        b_i.view(1, 1, 1, 1).expand(1, p.shape[1], p.shape[2], p.shape[3]),
+                    ).squeeze(0)
+                    p_bh = p_b.gather(
+                        0,
+                        h_i.view(1, 1, 1).expand(1, p_b.shape[1], p_b.shape[2]),
+                    ).squeeze(0)
+                    p_q = p_bh.gather(
+                        0, q_i.view(1, 1).expand(1, p_bh.shape[1])
+                    ).squeeze(0)
+
+                    pos_b = pos_emb_proj.gather(
+                        0,
+                        b_i.view(1, 1, 1, 1).expand(
+                            1,
+                            pos_emb_proj.shape[1],
+                            pos_emb_proj.shape[2],
+                            pos_emb_proj.shape[3],
+                        ),
+                    ).squeeze(0)
+                    pos_bh = pos_b.gather(
+                        0,
+                        h_i.view(1, 1, 1).expand(1, pos_b.shape[1], pos_b.shape[2]),
+                    ).squeeze(0)
+                    pos_r = pos_bh.gather(
+                        0, rel.view(1, 1).expand(1, pos_bh.shape[1])
+                    ).squeeze(0)
+
+                    score = score + (p_q * pos_r).sum()
+
                 if has_attn_mask:
-                    m = (
-                        attn_mask[q_idx, k_idx]
-                        if attn_mask.ndim == 2
-                        else attn_mask[b, q_idx, k_idx]
-                    )
+                    assert attn_mask is not None
+                    if attn_mask.ndim == 2:
+                        m0 = attn_mask
+                    else:
+                        m0 = attn_mask.gather(
+                            0,
+                            b_i.view(1, 1, 1).expand(
+                                1, attn_mask.shape[1], attn_mask.shape[2]
+                            ),
+                        ).squeeze(0)
+                    row = m0.gather(0, q_i.view(1, 1).expand(1, m0.shape[1])).squeeze(0)
+                    m = row.gather(0, k_i.view(1)).squeeze(0)
                     score = torch.where(m, torch.full_like(score, -1000.0), score)
+
                 if has_kpm:
-                    m = src_key_padding_mask[b, k_idx]
+                    assert src_key_padding_mask is not None
+                    kpm0 = src_key_padding_mask.gather(
+                        0, b_i.view(1, 1).expand(1, src_key_padding_mask.shape[1])
+                    ).squeeze(0)
+                    m = kpm0.gather(0, k_i.view(1)).squeeze(0)
                     score = torch.where(m, torch.full_like(score, -1000.0), score)
+
                 return score
 
             y = _flex_attention(q, k, v, score_mod=score_mod, scale=1.0)
@@ -1021,20 +1080,76 @@ class Zipformer2EncoderLayer(nn.Module):
             has_kpm = src_key_padding_mask is not None
 
             def score_mod(score, b, h, q_idx, k_idx):
+                # See self_attn1's score_mod: avoid Python indexing with tensor indices.
+
+                def _as_i64_index(x):
+                    if torch.is_tensor(x):
+                        return x.to(dtype=torch.int64)
+                    return score.new_tensor(x, dtype=torch.int64)
+
+                b_i = _as_i64_index(b)
+                h_i = _as_i64_index(h)
+                q_i = _as_i64_index(q_idx)
+                k_i = _as_i64_index(k_idx)
+
                 if use_pos:
-                    rel = (seq_len - 1) + k_idx - q_idx
-                    for d in range(pos_head_dim):
-                        score = score + p[b, h, q_idx, d] * pos_emb_proj[b, h, rel, d]
+                    assert pos_emb_proj is not None
+                    rel = (seq_len - 1) + k_i - q_i
+
+                    p_b = p.gather(
+                        0,
+                        b_i.view(1, 1, 1, 1).expand(1, p.shape[1], p.shape[2], p.shape[3]),
+                    ).squeeze(0)
+                    p_bh = p_b.gather(
+                        0,
+                        h_i.view(1, 1, 1).expand(1, p_b.shape[1], p_b.shape[2]),
+                    ).squeeze(0)
+                    p_q = p_bh.gather(
+                        0, q_i.view(1, 1).expand(1, p_bh.shape[1])
+                    ).squeeze(0)
+
+                    pos_b = pos_emb_proj.gather(
+                        0,
+                        b_i.view(1, 1, 1, 1).expand(
+                            1,
+                            pos_emb_proj.shape[1],
+                            pos_emb_proj.shape[2],
+                            pos_emb_proj.shape[3],
+                        ),
+                    ).squeeze(0)
+                    pos_bh = pos_b.gather(
+                        0,
+                        h_i.view(1, 1, 1).expand(1, pos_b.shape[1], pos_b.shape[2]),
+                    ).squeeze(0)
+                    pos_r = pos_bh.gather(
+                        0, rel.view(1, 1).expand(1, pos_bh.shape[1])
+                    ).squeeze(0)
+
+                    score = score + (p_q * pos_r).sum()
+
                 if has_attn_mask:
-                    m = (
-                        attn_mask[q_idx, k_idx]
-                        if attn_mask.ndim == 2
-                        else attn_mask[b, q_idx, k_idx]
-                    )
+                    assert attn_mask is not None
+                    if attn_mask.ndim == 2:
+                        m0 = attn_mask
+                    else:
+                        m0 = attn_mask.gather(
+                            0,
+                            b_i.view(1, 1, 1).expand(
+                                1, attn_mask.shape[1], attn_mask.shape[2]
+                            ),
+                        ).squeeze(0)
+                    row = m0.gather(0, q_i.view(1, 1).expand(1, m0.shape[1])).squeeze(0)
+                    m = row.gather(0, k_i.view(1)).squeeze(0)
                     score = torch.where(m, torch.full_like(score, -1000.0), score)
+
                 if has_kpm:
-                    m = src_key_padding_mask[b, k_idx]
+                    assert src_key_padding_mask is not None
+                    kpm0 = src_key_padding_mask.gather(
+                        0, b_i.view(1, 1).expand(1, src_key_padding_mask.shape[1])
+                    ).squeeze(0)
+                    m = kpm0.gather(0, k_i.view(1)).squeeze(0)
                     score = torch.where(m, torch.full_like(score, -1000.0), score)
+
                 return score
 
             y = _flex_attention(q, k, v, score_mod=score_mod, scale=1.0)
