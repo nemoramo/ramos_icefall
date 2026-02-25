@@ -49,23 +49,20 @@ from torch import Tensor, nn
 
 from icefall.utils import torch_autocast
 
-_flex_attention = None
 try:
-    # Newer PyTorch provides FlexAttention as a submodule.
-    from torch.nn.attention.flex_attention import flex_attention as _flex_attention  # type: ignore
-except Exception:
-    try:
-        # Some older/nightly builds may expose it from torch.nn.attention.
-        from torch.nn.attention import flex_attention as _flex_attention_import  # type: ignore
+    # PyTorch >= 2.5 (exact version depends on build) provides FlexAttention.
+    # We keep the import optional so older environments still work with the
+    # default (non-flex) attention implementation.
+    from torch.nn.attention import flex_attention as _flex_attention_import  # type: ignore
 
-        # In some torch versions `torch.nn.attention.flex_attention` is a module;
-        # in others it may be the callable directly.
-        if callable(_flex_attention_import):
-            _flex_attention = _flex_attention_import
-        else:
-            _flex_attention = getattr(_flex_attention_import, "flex_attention", None)
-    except Exception:
-        _flex_attention = None
+    # In some torch versions `torch.nn.attention.flex_attention` is a module;
+    # in others it may be the callable directly.
+    if callable(_flex_attention_import):
+        _flex_attention = _flex_attention_import
+    else:
+        _flex_attention = getattr(_flex_attention_import, "flex_attention", None)
+except Exception:
+    _flex_attention = None
 
 
 class Zipformer2(EncoderInterface):
