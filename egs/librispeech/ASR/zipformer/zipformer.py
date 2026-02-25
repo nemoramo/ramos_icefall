@@ -53,14 +53,7 @@ try:
     # PyTorch >= 2.5 (exact version depends on build) provides FlexAttention.
     # We keep the import optional so older environments still work with the
     # default (non-flex) attention implementation.
-    from torch.nn.attention import flex_attention as _flex_attention_import  # type: ignore
-
-    # In some torch versions `torch.nn.attention.flex_attention` is a module;
-    # in others it may be the callable directly.
-    if callable(_flex_attention_import):
-        _flex_attention = _flex_attention_import
-    else:
-        _flex_attention = getattr(_flex_attention_import, "flex_attention", None)
+    from torch.nn.attention import flex_attention as _flex_attention  # type: ignore
 except Exception:
     _flex_attention = None
 
