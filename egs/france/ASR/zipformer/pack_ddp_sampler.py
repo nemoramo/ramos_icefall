@@ -215,6 +215,23 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
                 )
                 self.pack_fill_strategy = "legacy"
 
+        if self.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack"):
+            assert self.pack_max_duration is not None, self.pack_max_duration
+            assert self.max_cuts_per_rank is not None, self.max_cuts_per_rank
+            required = float(self.max_cuts_per_rank) * float(self.pack_max_duration)
+            if float(self.max_duration_per_rank) < required:
+                raise ValueError(
+                    f"{self.pack_fill_strategy} requires "
+                    "--max-duration >= --max-cuts * --concatenate-cuts-max-duration "
+                    "to keep --max-duration as a strict per-rank upper bound in each step. "
+                    f"Got --max-duration={self.max_duration_per_rank:.1f}, "
+                    f"--max-cuts={int(self.max_cuts_per_rank)}, "
+                    f"--concatenate-cuts-max-duration={float(self.pack_max_duration):.1f} "
+                    f"(--max-cuts * --concatenate-cuts-max-duration = {required:.1f}). "
+                    "Fix: increase --max-duration, or decrease --max-cuts / "
+                    "--concatenate-cuts-max-duration."
+                )
+
         self._legacy_mega_batch_mode = False
         self._legacy_mega_max_duration = None
         self._legacy_mega_max_cuts = None

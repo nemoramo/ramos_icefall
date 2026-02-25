@@ -1306,24 +1306,34 @@ def compute_loss(
     feature = feature.to(device)
 
     supervisions = batch["supervisions"]
+    num_seqs = int(feature.size(0))
+    n_sup = len(supervisions.get("text", []))
+    is_packed_batch = n_sup != num_seqs
+    allow_packed = bool(getattr(params, "use_packed_supervisions", False))
+    if is_packed_batch and not allow_packed:
+        raise ValueError(
+            "Detected a packed batch (len(supervisions['text']) != inputs.size(0)) "
+            f"but --use-packed-supervisions is False. num_seqs={num_seqs}, n_sup={n_sup}. "
+            "Fix: set --use-packed-supervisions True, or disable CutConcatenate/packing."
+        )
     # Compute per-sequence lengths. This is required when CutConcatenate packing is used
     # (multiple supervisions per sequence), and is equivalent to num_frames in the
     # non-packed case.
-    num_seqs = feature.size(0)
     feature_lens_list = _compute_feature_lens_list(supervisions, num_seqs=num_seqs)
     feature_lens = torch.tensor(feature_lens_list, device=device, dtype=torch.int64)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    use_packed = is_training and getattr(params, "use_packed_supervisions", False)
-    if use_packed and getattr(params, "pack_attn_mask", False):
+    use_packed = bool(is_packed_batch and allow_packed)
+    if use_packed and getattr(params, "pack_attn_mask", False) and is_training:
         attn_mask = build_packed_attention_mask(
             supervisions=supervisions, seq_lens=feature_lens_list, device=device
         )
     else:
         attn_mask = None
 
+    packed_supervision_segments = None
     if use_packed:
         # Sort supervision segments by duration (descending) and re-order texts
         # consistently. We'll compute losses independently per supervision segment.
@@ -1489,6 +1499,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
+    warned_packed_valid_wer = False
 
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
@@ -1542,6 +1553,24 @@ def compute_validation_loss(
                 params.valid_wer_max_batches > 0
                 and batch_idx >= params.valid_wer_max_batches
             ):
+                continue
+
+            # Packed validation batches are not supported for WER decoding:
+            # current greedy-search assumes 1-utterance-per-sequence.
+            inputs = batch.get("inputs")
+            supervisions = batch.get("supervisions", {})
+            num_seqs = int(inputs.size(0)) if isinstance(inputs, torch.Tensor) else 0
+            n_sup = len(supervisions.get("text", []))
+            is_packed_batch = n_sup != num_seqs
+            if is_packed_batch:
+                if not warned_packed_valid_wer:
+                    logging.warning(
+                        "Validation batch is packed (n_sup != num_seqs); skipping WER computation "
+                        "because greedy-search assumes 1-utt-per-seq. n_sup=%s num_seqs=%s",
+                        n_sup,
+                        num_seqs,
+                    )
+                    warned_packed_valid_wer = True
                 continue
 
             feature = batch["inputs"].to(device)

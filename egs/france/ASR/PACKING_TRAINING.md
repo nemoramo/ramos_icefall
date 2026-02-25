@@ -40,6 +40,7 @@
 
 - `--max-cuts > 0`：需要固定每 rank 的 packed cut 数，才能让每步 shape 稳定。
 - `--concatenate-cuts-max-duration > 0`：需要明确每条 packed cut 的上限（秒）。
+- `--max-duration >= --max-cuts * --concatenate-cuts-max-duration`：为保证 bestfit/knapsack 下 `--max-duration` 仍能作为每步（per-rank）的严格上界；否则会直接报错。
 
 ## 3. 推荐默认参数（当前 france recipe）
 
