@@ -501,7 +501,7 @@ def get_parser():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=32,
+        default=16,
         help="The number of training dataloader workers that "
         "collect the batches.",
     )
@@ -749,7 +749,7 @@ def get_parser():
     parser.add_argument(
         "--use-packed-supervisions",
         type=str2bool,
-        default=False,
+        default=True,
         help=(
             "If True (train-only), support CutConcatenate packing by slicing encoder outputs "
             "per supervision segment and computing RNNT/CTC losses independently per original utterance."
@@ -758,7 +758,7 @@ def get_parser():
     parser.add_argument(
         "--pack-attn-mask",
         type=str2bool,
-        default=False,
+        default=True,
         help=(
             "If True (requires --use-packed-supervisions), build a dense per-batch "
             "block-diagonal attention mask to prevent attention across concatenated utterances."
