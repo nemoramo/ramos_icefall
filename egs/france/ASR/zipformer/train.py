@@ -1067,21 +1067,6 @@ def get_encoder_embed(params: AttributeDict) -> nn.Module:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    if bool(getattr(params, "use_flex_attention", False)) and bool(
-        getattr(params, "torch_compile", False)
-    ):
-        # Inductor lowering for FlexAttention currently requires Q/K/V head dims >= 16.
-        # Without this, torch.compile fails with a LoweringException/NYI error.
-        q_dims = _to_int_tuple(params.query_head_dim)
-        v_dims = _to_int_tuple(params.value_head_dim)
-        if min(q_dims) < 16 or min(v_dims) < 16:
-            raise ValueError(
-                "use_flex_attention + torch.compile requires query_head_dim >= 16 "
-                f"and value_head_dim >= 16 (got query_head_dim={params.query_head_dim} "
-                f"value_head_dim={params.value_head_dim}). "
-                "Please set --value-head-dim 16 (and adjust related dims if needed)."
-            )
-
     encoder = Zipformer2(
         output_downsampling_factor=2,
         downsampling_factor=_to_int_tuple(params.downsampling_factor),
