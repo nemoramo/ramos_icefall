@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import k2
 import torch
@@ -24,7 +24,6 @@ import torch.nn as nn
 from encoder_interface import EncoderInterface
 from lhotse.dataset import SpecAugment
 from scaling import ScaledLinear
-from torch.nn.utils.rnn import pad_sequence
 
 from icefall.utils import add_sos, make_pad_mask, time_warp, torch_autocast
 
@@ -190,45 +189,38 @@ class AsrModel(nn.Module):
         assert encoder_out.ndim == 3, encoder_out.shape
         assert encoder_out_lens.ndim == 1, encoder_out_lens.shape
 
-        # Move lengths to CPU once to avoid per-segment device syncs.
-        enc_lens = encoder_out_lens.detach().cpu().tolist()
-        segments = supervision_segments.detach().cpu().tolist()
+        device = encoder_out.device
+        seg = supervision_segments.to(device=device, dtype=torch.long)
+        if seg.numel() == 0:
+            return encoder_out.new_zeros(
+                (0, 0, encoder_out.size(-1))
+            ), encoder_out_lens.new_zeros((0,))
 
-        sliced: List[torch.Tensor] = []
-        sliced_lens: List[int] = []
-        for seq_idx, start, length in segments:
-            seq_idx = int(seq_idx)
-            start = int(start)
-            length = int(length)
+        seq_idx = seg[:, 0]
+        start = seg[:, 1]
+        length = torch.clamp_min(seg[:, 2], 1)
 
-            # Ensure every segment has at least 1 frame.
-            if length <= 0:
-                length = 1
+        enc_lens = torch.clamp_min(encoder_out_lens.to(device=device, dtype=torch.long), 1)
+        seq_len = enc_lens[seq_idx]
 
-            seq_len = int(enc_lens[seq_idx])
-            if seq_len <= 0:
-                # Should not happen, but keep shapes consistent.
-                seq_len = 1
+        start = torch.clamp_min(start, 0)
+        start = torch.minimum(start, seq_len - 1)
+        end = torch.minimum(start + length, seq_len)
+        end = torch.maximum(end, start + 1)
 
-            if start < 0:
-                start = 0
-            if start >= seq_len:
-                start = seq_len - 1
+        sliced_lens = end - start
+        t_max = int(sliced_lens.max().item())
 
-            end = start + length
-            if end > seq_len:
-                end = seq_len
-            if end <= start:
-                end = min(start + 1, seq_len)
+        frame_off = torch.arange(t_max, device=device).unsqueeze(0)  # (1, Tmax)
+        frame_idx = start.unsqueeze(1) + frame_off  # (S, Tmax)
+        valid = frame_off < sliced_lens.unsqueeze(1)
+        frame_idx = torch.minimum(frame_idx, (seq_len - 1).unsqueeze(1))
 
-            sliced.append(encoder_out[seq_idx, start:end, :])
-            sliced_lens.append(end - start)
+        seq_idx_2d = seq_idx.unsqueeze(1).expand(-1, t_max)
+        sliced_out = encoder_out[seq_idx_2d, frame_idx, :]  # (S, Tmax, C)
+        sliced_out = sliced_out * valid.unsqueeze(-1).to(dtype=sliced_out.dtype)
 
-        sliced_out = pad_sequence(sliced, batch_first=True)  # (S, Tmax, C)
-        sliced_out_lens = torch.tensor(
-            sliced_lens, device=encoder_out.device, dtype=encoder_out_lens.dtype
-        )
-        return sliced_out, sliced_out_lens
+        return sliced_out, sliced_lens.to(dtype=encoder_out_lens.dtype)
 
     def forward_ctc(
         self,

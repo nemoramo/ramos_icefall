@@ -609,6 +609,51 @@ def get_parser():
         default=50,
         help="Print training stats every this many local batches.",
     )
+    parser.add_argument(
+        "--cuda-sync-for-timing",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, call torch.cuda.synchronize() around forward/backward/step "
+            "timing points. Disable for best throughput and fewer synchronization bubbles."
+        ),
+    )
+    parser.add_argument(
+        "--enable-smi-in-train-log",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, query nvidia-smi in the training logging path. "
+            "This may add subprocess overhead and jitter."
+        ),
+    )
+    parser.add_argument(
+        "--shape-gather-interval",
+        type=int,
+        default=200,
+        help=(
+            "How often (in global train steps) to all_gather per-rank batch-shape "
+            "stats in DDP. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--skip-valid-steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, skip running validation for global train steps lower than this "
+            "value (useful for performance debugging)."
+        ),
+    )
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        type=str2bool,
+        default=True,
+        help=(
+            "Value for DDP find_unused_parameters. "
+            "Set False only if you have verified all parameters receive gradients."
+        ),
+    )
 
     # Torch profiler (optional): useful to diagnose bubbles (e.g., dataloader stalls,
     # DDP sync/all-reduce, unexpected CPU work). Profiling adds noticeable overhead,
@@ -1769,7 +1814,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
-        compute_start = time.perf_counter()
+        compute_start = iter_start
 
         if batch_idx % 10 == 0:
             set_batch_count(model, get_adjusted_batch_count(params))
@@ -1807,7 +1852,9 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         try:
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and bool(
+                getattr(params, "cuda_sync_for_timing", False)
+            ):
                 torch.cuda.synchronize()
             with _prof_record("forward_loss"):
                 with torch.cuda.amp.autocast(enabled=params.use_fp16):
@@ -1831,7 +1878,9 @@ def train_one_epoch(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and bool(
+                getattr(params, "cuda_sync_for_timing", False)
+            ):
                 torch.cuda.synchronize()
         except Exception as e:
             err_msg = str(e)
@@ -1918,22 +1967,24 @@ def train_one_epoch(
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
             iter_end = time.perf_counter()
-            iter_time = iter_end - iter_start
             compute_time = iter_end - compute_start
+            step_time = data_time + compute_time
             batch_audio_sec = 0.0
             if batch["supervisions"]["num_frames"] is not None:
                 batch_audio_sec = (
                     float(batch["supervisions"]["num_frames"].float().sum().item())
                     / 100.0
                 )
-            batch_time_ms = iter_time * 1000.0
+            batch_time_ms = step_time * 1000.0
             data_time_ms = data_time * 1000.0
             compute_time_ms = compute_time * 1000.0
             speed_utt = (
-                batch_size / max(iter_time, 1e-6) if batch_size > 0 else 0.0
+                batch_size / max(step_time, 1e-6) if batch_size > 0 else 0.0
             )
             speed_audio = (
-                batch_audio_sec / max(iter_time, 1e-6) if batch_audio_sec > 0 else 0.0
+                batch_audio_sec / max(step_time, 1e-6)
+                if batch_audio_sec > 0
+                else 0.0
             )
             if torch.cuda.is_available():
                 gpu_mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
@@ -1987,7 +2038,13 @@ def train_one_epoch(
                     # Conv2dSubsampling reduces length as: (T - 7) // 2
                     mask_t = max(0, (int(lens_max) - 7) // 2)
 
-                if world_size > 1 and dist.is_initialized():
+                shape_gather_interval = int(getattr(params, "shape_gather_interval", 200))
+                do_shape_gather = (
+                    shape_gather_interval > 0
+                    and params.batch_idx_train % shape_gather_interval == 0
+                )
+
+                if world_size > 1 and dist.is_initialized() and do_shape_gather:
                     backend = dist.get_backend()
                     use_cuda_gather = torch.cuda.is_available() and backend == "nccl"
                     dev = (
@@ -2109,7 +2166,7 @@ def train_one_epoch(
                                     speech_ratio_r,
                                     params.batch_idx_train,
                                 )
-                else:
+                elif world_size <= 1 or not dist.is_initialized():
                     nonpad_ratio = (
                         float(lens_sum) / float(total_frames) if total_frames > 0 else 0.0
                     )
@@ -2164,7 +2221,11 @@ def train_one_epoch(
                     params.batch_idx_train,
                 )
                 # GPU utilization curve (from nvidia-smi). Best-effort only.
-                smi = _query_nvidia_smi()
+                smi = (
+                    _query_nvidia_smi()
+                    if bool(getattr(params, "enable_smi_in_train_log", False))
+                    else None
+                )
                 if smi:
                     idxs = sorted(smi.keys())
                     util_avg = sum(smi[i]["util_gpu"] for i in idxs) / max(1, len(idxs))
@@ -2196,10 +2257,10 @@ def train_one_epoch(
                     )
 
         _profiler_step_and_maybe_stop()
-        prev_step_end = time.perf_counter()
         if (
             params.batch_idx_train > 0
             and params.batch_idx_train % params.valid_interval == 0
+            and params.batch_idx_train >= int(getattr(params, "skip_valid_steps", 0))
             and not params.print_diagnostics
         ):
             logging.info("Computing validation loss")
@@ -2236,6 +2297,7 @@ def train_one_epoch(
                 f"Reached max_train_steps={params.max_train_steps}; stopping training loop."
             )
             break
+        prev_step_end = time.perf_counter()
 
     if prof is not None:
         _stop_profiler("epoch_end")
@@ -2348,8 +2410,11 @@ def run(rank, world_size, args):
 
     model.to(device)
     if world_size > 1:
-        logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        ddp_find_unused = bool(getattr(params, "ddp_find_unused_parameters", True))
+        logging.info("Using DDP (find_unused_parameters=%s)", ddp_find_unused)
+        model = DDP(
+            model, device_ids=[rank], find_unused_parameters=ddp_find_unused
+        )
 
     logging.info("Rank %s: building optimizer parameter groups", rank)
     param_groups = get_parameter_groups_with_lrs(
