@@ -2061,7 +2061,10 @@ def train_one_epoch(
                         speech_frames = 0
                 total_frames = int(nseq) * int(t)
 
-                use_packed = bool(getattr(params, "use_packed_supervisions", False))
+                is_packed_batch = int(n_sup) != int(nseq)
+                use_packed = is_packed_batch and bool(
+                    getattr(params, "use_packed_supervisions", False)
+                )
                 mask_t = 0
                 if use_packed and bool(getattr(params, "pack_attn_mask", False)):
                     # Conv2dSubsampling reduces length as: (T - 7) // 2
