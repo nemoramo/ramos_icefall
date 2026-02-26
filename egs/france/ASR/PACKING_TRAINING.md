@@ -152,3 +152,50 @@ Sampler 混洗与 I/O 并发：
 数据后端（默认 TOS）：
 
 - `--audio-path-backend`：默认 `tos`，会抽样检查 cuts 里音频路径必须以 `--tos-mount-prefix` 开头；本地盘数据用 `local`，调试用 `auto`（跳过检查）。
+
+## 8. 流式 Chunk-based 训练与 packing 的 attention mask 说明
+
+本节主要说明两点：
+
+1) `Zipformer2` 在 chunk-based（causal）训练下生成的 **chunkwise attention mask** 是怎样的；
+2) packing 训练时我们构建的 packed block-diagonal mask 会如何与 chunk mask 合并，以及它在流式训练里带来的一个常见“对齐差异”（通常影响很小，但建议记录）。
+
+### 8.1 Zipformer2 的 chunkwise attention mask（非简单下三角）
+
+当 `--causal=1` 且本 step 采样到的 `chunk_size > 0` 时，`Zipformer2` 会生成 chunkwise attention mask：
+每个时刻只能看“当前 chunk + 左侧若干 chunks”，而不是简单的下三角 causal mask。
+
+实现位于 `egs/librispeech/ASR/zipformer/zipformer.py` 的 `Zipformer2._get_attn_mask()`：
+
+- 先按时间轴计算 chunk id：`c = t // chunk_size`
+- 然后 mask 两类位置（注意：`True=masked`）：
+  - `src_c > tgt_c`：未来 chunk（禁止看未来）
+  - `src_c < tgt_c - left_context_chunks`：过久远的历史（只保留左侧若干 chunk 的 context）
+
+补充：`chunk_size=-1` 表示 full-context（不会生成 chunk mask）；同时 `chunk_size`/`left_context_frames` 在训练时通常是从列表里随机采样得到的（见 `get_chunk_info()`）。
+
+### 8.2 与 packed block-diagonal mask 的合并逻辑
+
+当启用 `--use-packed-supervisions=1` 且 `--pack-attn-mask=1` 时，packing 训练会为 packed batch 构造
+packed block-diagonal external mask（不同 supervision 段之间互相全禁，常见形状为 `(B,T,T)`，`True=masked`）。
+
+在 `Zipformer2.forward()` 中，external `attn_mask` 会与内部的 `chunk_attn_mask` 通过 `torch.logical_or` 合并
+（必要时会把 2D chunk mask unsqueeze 成 3D 以便与 per-batch mask 广播）。
+
+由于 `True=masked`，`logical_or` 等价于：
+- masked 集合取并集
+- allowed 集合取交集
+
+也就是说：**既要满足 chunk 约束，也要满足 block-diagonal 约束**（两者同时生效）。
+
+### 8.3 packing 对 chunk 边界对齐的影响（随机 chunk offset）
+
+你可能会注意到一个“训练 vs 推理”的对齐差异：
+
+- 不 packing 时：每条 utterance 都从 `t=0` 开始，所以 chunk 边界天然对齐到 utterance 开头（末尾 chunk 可能不满，这两者都一样）。
+- packing 后：chunk mask 的 chunk 划分是按 packed 序列的绝对时间 `t=0..T-1` 来切的；而每个 supervision 段的起点 `s`
+  往往不在 `chunk_size` 的整数倍上，于是该 utterance 的“第一个 chunk”相当于带了一个随机 offset（开头可能是一个“残 chunk”）。
+
+这会导致：训练时看到的 chunk 对齐方式与推理时“每条 utterance 从 0 开 streaming”不完全一致。
+通常影响很小，更像是一种 **random chunk-offset augmentation**（随机 chunk 对齐增强），不需要为了“严格对齐”专门改训练实现；
+但建议在实验记录里明确写清楚是否启用了 packing、`--causal`、`--chunk-size`/`--left-context-frames` 等配置，方便复现实验与排障对比。
