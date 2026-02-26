@@ -37,16 +37,17 @@ DIST_BACKEND="${DIST_BACKEND:-nccl}"
 MASTER_PORT="${MASTER_PORT:-12360}"
 EXP_DIR="${EXP_DIR:-${DATA_ROOT}/experiments/zipformer/$(date +%Y%m%d)_france_onfly}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${EXP_DIR}/tensorboard}"
-MAX_DURATION="${MAX_DURATION:-3000}"
+MAX_DURATION="${MAX_DURATION:-1500}"
+MAX_CUTS="${MAX_CUTS:-50}"
 MAX_TRAIN_CUT_DURATION="${MAX_TRAIN_CUT_DURATION:-30}"
 MAX_VALID_CUT_DURATION="${MAX_VALID_CUT_DURATION:-${MAX_TRAIN_CUT_DURATION}}"
 VALID_NUM_CUTS="${VALID_NUM_CUTS:-2000}"
 NUM_BUCKETS="${NUM_BUCKETS:-60}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
-VALID_NUM_WORKERS="${VALID_NUM_WORKERS:-5}"
-TRAIN_PREFETCH_FACTOR="${TRAIN_PREFETCH_FACTOR:-12}"
-VALID_PREFETCH_FACTOR="${VALID_PREFETCH_FACTOR:-6}"
-TEST_PREFETCH_FACTOR="${TEST_PREFETCH_FACTOR:-6}"
+VALID_NUM_WORKERS="${VALID_NUM_WORKERS:-6}"
+TRAIN_PREFETCH_FACTOR="${TRAIN_PREFETCH_FACTOR:-16}"
+VALID_PREFETCH_FACTOR="${VALID_PREFETCH_FACTOR:-8}"
+TEST_PREFETCH_FACTOR="${TEST_PREFETCH_FACTOR:-8}"
 BUCKET_BUFFER_SIZE="${BUCKET_BUFFER_SIZE:-30000}"
 BUCKET_SHUFFLE_BUFFER_SIZE="${BUCKET_SHUFFLE_BUFFER_SIZE:-30000}"
 VALID_INTERVAL="${VALID_INTERVAL:-1000}"
@@ -56,6 +57,19 @@ NUM_EPOCHS="${NUM_EPOCHS:-80}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20000}"
 START_EPOCH="${START_EPOCH:-1}"
 START_BATCH="${START_BATCH:-0}"
+
+# Packing presets:
+# - lhotse_legacy: dataset-side CutConcatenate (each rank packs independently)
+# - bestfit: DDP pack sampler + raw_best_fit
+# - knapsack: DDP pack sampler + raw_best_fit_knapsack (recommended)
+PACKING_METHOD="${PACKING_METHOD:-knapsack}"
+
+# Audio backend:
+# - tos (recommended): require TOS-mounted audio paths (prefix below)
+# - local: allow local filesystem paths
+# - auto: skip checks
+AUDIO_PATH_BACKEND="${AUDIO_PATH_BACKEND:-tos}"
+TOS_MOUNT_PREFIX="${TOS_MOUNT_PREFIX:-/mnt/asr-audio-data}"
 
 # Usually disabled for online feature benchmarks to avoid extra startup overhead.
 SKIP_OOM_SCAN="${SKIP_OOM_SCAN:-1}"
@@ -80,6 +94,7 @@ python ./zipformer/train.py \
   --start-epoch "${START_EPOCH}" \
   --start-batch "${START_BATCH}" \
   --max-duration "${MAX_DURATION}" \
+  --max-cuts "${MAX_CUTS}" \
   --max-train-cut-duration "${MAX_TRAIN_CUT_DURATION}" \
   --max-valid-cut-duration "${MAX_VALID_CUT_DURATION}" \
   --valid-num-cuts "${VALID_NUM_CUTS}" \
@@ -103,6 +118,9 @@ python ./zipformer/train.py \
   --prefetch-factor "${TRAIN_PREFETCH_FACTOR}" \
   --valid-prefetch-factor "${VALID_PREFETCH_FACTOR}" \
   --test-prefetch-factor "${TEST_PREFETCH_FACTOR}" \
+  --packing-method "${PACKING_METHOD}" \
+  --audio-path-backend "${AUDIO_PATH_BACKEND}" \
+  --tos-mount-prefix "${TOS_MOUNT_PREFIX}" \
   --compute-valid-wer "${COMPUTE_VALID_WER}" \
   --valid-wer-max-batches "${VALID_WER_MAX_BATCHES}" \
   --wer-lowercase "${WER_LOWERCASE}" \

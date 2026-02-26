@@ -22,7 +22,7 @@ import inspect
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import torch
 from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
@@ -43,6 +43,8 @@ from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
+
+from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
 
 
 class _SeedWorkers:
@@ -73,6 +75,147 @@ class MSR_AsrDataModule:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self._normalize_args()
+
+    def _normalize_args(self) -> None:
+        """Normalize/validate CLI args to reduce confusing combinations.
+
+        We keep the low-level switches (`--concatenate-cuts`, `--ddp-pack-sampler`,
+        `--pack-fill-strategy`, ...) for backward compatibility, but provide a
+        simpler high-level knob (`--packing-method`) and sane defaults.
+        """
+
+        # High-level packing shortcut (optional).
+        packing_method = getattr(self.args, "packing_method", None)
+        if packing_method is not None:
+            pm = str(packing_method).strip().lower()
+            if pm in ("none", "off", "disable"):
+                self.args.concatenate_cuts = False
+                self.args.ddp_pack_sampler = False
+            elif pm in ("lhotse_legacy", "legacy", "lhotse"):
+                # Lhotse legacy: pack in the dataset (each rank packs independently in DDP).
+                self.args.concatenate_cuts = True
+                self.args.ddp_pack_sampler = False
+            elif pm in ("bestfit", "best_fit"):
+                self.args.concatenate_cuts = True
+                self.args.ddp_pack_sampler = True
+                self.args.pack_fill_strategy = "raw_best_fit"
+            elif pm in ("knapsack", "ksnapbak"):
+                self.args.concatenate_cuts = True
+                self.args.ddp_pack_sampler = True
+                self.args.pack_fill_strategy = "raw_best_fit_knapsack"
+            else:
+                raise ValueError(
+                    f"Unsupported --packing-method={packing_method!r}. "
+                    "Use one of: none, lhotse_legacy, bestfit, knapsack."
+                )
+
+        # If DDP pack sampler is requested, packing is implied.
+        if bool(getattr(self.args, "ddp_pack_sampler", False)) and not bool(
+            getattr(self.args, "concatenate_cuts", False)
+        ):
+            self.args.concatenate_cuts = True
+
+        # Normalize pack-fill-strategy aliases for convenience.
+        pfs = str(getattr(self.args, "pack_fill_strategy", "legacy")).strip().lower()
+        aliases = {
+            "bestfit": "raw_best_fit",
+            "best_fit": "raw_best_fit",
+            "raw-best-fit": "raw_best_fit",
+            "knapsack": "raw_best_fit_knapsack",
+            "ksnapbak": "raw_best_fit_knapsack",
+            "raw_best_fit": "raw_best_fit",
+            "raw_best_fit_knapsack": "raw_best_fit_knapsack",
+            "legacy": "legacy",
+        }
+        self.args.pack_fill_strategy = aliases.get(pfs, pfs)
+
+        # Make invalid combinations explicit (avoid silent fallback).
+        world_size = int(getattr(self.args, "world_size", 1))
+        if (
+            world_size > 1
+            and bool(getattr(self.args, "ddp_pack_sampler", False))
+            and self.args.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack")
+        ):
+            max_cuts = int(getattr(self.args, "max_cuts", 0))
+            if max_cuts <= 0:
+                raise ValueError(
+                    f"--pack-fill-strategy={self.args.pack_fill_strategy} requires --max-cuts > 0 "
+                    "(fixed max cuts per-rank) to keep per-step shapes stable."
+                )
+            pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
+            if pack_max_dur <= 0:
+                raise ValueError(
+                    f"--pack-fill-strategy={self.args.pack_fill_strategy} requires "
+                    "--concatenate-cuts-max-duration > 0 (packed cut upper bound in seconds)."
+                )
+
+    def _iter_first_n(self, cuts: CutSet, n: int) -> Iterable[Any]:
+        if n <= 0:
+            return []
+        it = iter(cuts)
+        out = []
+        for _ in range(int(n)):
+            try:
+                out.append(next(it))
+            except StopIteration:
+                break
+        return out
+
+    def _get_first_audio_source(self, cut: Any) -> Optional[str]:
+        try:
+            rec = getattr(cut, "recording", None)
+            if rec is None:
+                return None
+            sources = getattr(rec, "sources", None)
+            if not sources:
+                return None
+            src = getattr(sources[0], "source", None)
+            if src is None:
+                return None
+            return str(src)
+        except Exception:
+            return None
+
+    def _validate_audio_path_backend(self, cuts: CutSet, *, kind: str) -> None:
+        backend = str(getattr(self.args, "audio_path_backend", "auto")).strip().lower()
+        n = int(getattr(self.args, "audio_path_check_cuts", 20))
+        if n <= 0 or backend in ("auto", "any", "local"):
+            return
+
+        if backend != "tos":
+            logging.warning(
+                "Unknown audio_path_backend=%s (kind=%s); skipping checks.",
+                backend,
+                kind,
+            )
+            return
+
+        prefix = str(getattr(self.args, "tos_mount_prefix", "/mnt/asr-audio-data")).rstrip(
+            "/"
+        )
+        checked = 0
+        for cut in self._iter_first_n(cuts, n):
+            checked += 1
+            src = self._get_first_audio_source(cut)
+            if src is None:
+                continue
+            if src == prefix or src.startswith(prefix + "/"):
+                continue
+            raise ValueError(
+                f"audio-path-backend=tos but found a non-TOS audio source in {kind} cuts: {src}\n"
+                f"Expected prefix: {prefix}\n"
+                "If your data is local, set --audio-path-backend local.\n"
+                "Otherwise, regenerate manifests with TOS-mounted audio paths."
+            )
+
+        logging.info(
+            "Audio path backend check: backend=%s kind=%s checked=%d prefix=%s",
+            backend,
+            kind,
+            checked,
+            prefix,
+        )
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser):
@@ -104,9 +247,28 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--max-duration",
             type=int,
-            default=200.0,
+            default=1500.0,
             help="Maximum pooled recordings duration (seconds) in a "
             "single batch. You can reduce it if it causes CUDA OOM.",
+        )
+        group.add_argument(
+            "--quadratic-duration",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional quadratic-duration correction for transformer-like models. "
+                "It modifies the effective duration as: dur + dur^2 / Q. "
+                "Recommended values are in [15, 40]. Set <= 0 to disable."
+            ),
+        )
+        group.add_argument(
+            "--max-cuts",
+            type=int,
+            default=50,
+            help=(
+                "Maximum number of cuts in a single batch (used by "
+                "DynamicBucketingSampler). Set <= 0 to disable."
+            ),
         )
         group.add_argument(
             "--bucketing-sampler",
@@ -118,14 +280,14 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--num-buckets",
             type=int,
-            default=30,
+            default=60,
             help="The number of buckets for the DynamicBucketingSampler"
             "(you might want to increase it for larger datasets).",
         )
         group.add_argument(
             "--bucketing-buffer-size",
             type=int,
-            default=2000,
+            default=30000,
             help=(
                 "Number of cut indexes to store in one bucket sampler buffer. "
                 "Higher values increase mixing randomness but consume more memory."
@@ -134,7 +296,7 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--bucketing-shuffle-buffer-size",
             type=int,
-            default=5000,
+            default=30000,
             help=(
                 "Number of cut indexes to keep in the shuffle buffer for the "
                 "DynamicBucketingSampler."
@@ -143,9 +305,101 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--concatenate-cuts",
             type=str2bool,
-            default=False,
+            default=True,
             help="When enabled, utterances (cuts) will be concatenated "
             "to minimize the amount of padding.",
+        )
+        group.add_argument(
+            "--packing-method",
+            type=str,
+            default=None,
+            help=(
+                "Simplified packing preset (optional). "
+                "Values: none, lhotse_legacy, bestfit, knapsack. "
+                "If set, it overrides --concatenate-cuts/--ddp-pack-sampler/--pack-fill-strategy."
+            ),
+        )
+        group.add_argument(
+            "--ddp-pack-sampler",
+            type=str2bool,
+            default=True,
+            help=(
+                "When enabled (DDP only), perform CutConcatenate packing inside the sampler "
+                "and then split packed cuts across ranks to balance compute. "
+                "This improves per-rank batch-shape consistency compared to packing in the dataset."
+            ),
+        )
+        group.add_argument(
+            "--pack-fill-strategy",
+            type=str,
+            default="raw_best_fit_knapsack",
+            help=(
+                "Packing strategy used by --ddp-pack-sampler. "
+                "Options: legacy, raw_best_fit, raw_best_fit_knapsack "
+                "(aliases: bestfit, knapsack)."
+            ),
+        )
+        group.add_argument(
+            "--pack-raw-pool-size",
+            type=int,
+            default=8000,
+            help=(
+                "Target raw-cut pool size used by raw_best_fit packing. "
+                "Set <= 0 to use sampler defaults."
+            ),
+        )
+        group.add_argument(
+            "--pack-max-pieces-per-bin",
+            type=int,
+            default=10,
+            help=(
+                "Maximum number of raw cuts allowed in one packed bin for raw_best_fit. "
+                "Set <= 0 to disable."
+            ),
+        )
+        group.add_argument(
+            "--pack-min-remaining-duration",
+            type=float,
+            default=0.5,
+            help=(
+                "Stop filling a raw_best_fit bin when remaining duration (seconds) "
+                "is below this threshold."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-rem",
+            type=float,
+            default=5.0,
+            help=(
+                "For raw_best_fit_knapsack: apply tail knapsack when remaining "
+                "duration (seconds) is <= this threshold."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-max-candidates",
+            type=int,
+            default=128,
+            help=(
+                "For raw_best_fit_knapsack: max short-cut candidates considered "
+                "in tail knapsack per bin."
+            ),
+        )
+        group.add_argument(
+            "--pack-tail-knapsack-max-pieces",
+            type=int,
+            default=4,
+            help=(
+                "For raw_best_fit_knapsack: max additional pieces selected by "
+                "tail knapsack per bin."
+            ),
+        )
+        group.add_argument(
+            "--valid-concatenate-cuts",
+            type=str2bool,
+            default=False,
+            help="When enabled, validation utterances (cuts) will be concatenated "
+            "to minimize the amount of padding. Recommended to keep it disabled "
+            "to avoid changing validation/WER semantics.",
         )
         group.add_argument(
             "--duration-factor",
@@ -153,6 +407,15 @@ class MSR_AsrDataModule:
             default=1.0,
             help="Determines the maximum duration of a concatenated cut "
             "relative to the duration of the longest cut in a batch.",
+        )
+        group.add_argument(
+            "--concatenate-cuts-max-duration",
+            type=float,
+            default=30.0,
+            help=(
+                "Upper bound (seconds) for each concatenated/packed cut when "
+                "--concatenate-cuts is enabled. Set <= 0 to disable."
+            ),
         )
         group.add_argument(
             "--gap",
@@ -165,10 +428,33 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--on-the-fly-feats",
             type=str2bool,
-            default=False,
+            default=True,
             help="When enabled, use on-the-fly cut mixing and feature "
             "extraction. Will drop existing precomputed feature manifests "
             "if available.",
+        )
+        group.add_argument(
+            "--audio-path-backend",
+            type=str,
+            default="tos",
+            help=(
+                "Preferred audio storage backend. "
+                "Use 'tos' to require TOS-mounted audio paths (default), "
+                "or 'local' to allow local filesystem paths, "
+                "or 'auto' to skip checks."
+            ),
+        )
+        group.add_argument(
+            "--tos-mount-prefix",
+            type=str,
+            default="/mnt/asr-audio-data",
+            help="TOS bucket mount prefix used when --audio-path-backend=tos.",
+        )
+        group.add_argument(
+            "--audio-path-check-cuts",
+            type=int,
+            default=20,
+            help="How many cuts (per manifest) to sample for audio-path backend validation. Set 0 to disable.",
         )
         group.add_argument(
             "--shuffle",
@@ -192,14 +478,6 @@ class MSR_AsrDataModule:
             "were used to construct it.",
         )
 
-        # group.add_argument(
-        #     "--num-workers",
-        #     type=int,
-        #     default=2,
-        #     help="The number of training dataloader workers that "
-        #     "collect the batches.",
-        # )
-
         group.add_argument(
             "--enable-spec-aug",
             type=str2bool,
@@ -220,7 +498,7 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--enable-musan",
             type=str2bool,
-            default=True,
+            default=False,
             help="When enabled, select noise from MUSAN and mix it"
             "with training dataset. ",
         )
@@ -234,19 +512,19 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--train-cuts-filename",
             type=str,
-            default="msr_cuts_train_urdu_0106.jsonl.gz",
+            default="msr_cuts_French_train.jsonl.gz",
             help="Training cuts filename under --manifest-dir.",
         )
         group.add_argument(
             "--valid-cuts-filename",
             type=str,
-            default="msr_cuts_valid_urdu_0106.jsonl.gz",
+            default="msr_cuts_French_valid.jsonl.gz",
             help="Validation cuts filename under --manifest-dir.",
         )
         group.add_argument(
             "--test-cuts-filename",
             type=str,
-            default="msr_cuts_test_urdu_0106.jsonl.gz",
+            default="msr_cuts_French_test.jsonl.gz",
             help="Test cuts filename under --manifest-dir.",
         )
         group.add_argument(
@@ -258,25 +536,25 @@ class MSR_AsrDataModule:
         group.add_argument(
             "--valid-num-workers",
             type=int,
-            default=2,
+            default=6,
             help="Validation dataloader workers.",
         )
         group.add_argument(
             "--prefetch-factor",
             type=int,
-            default=4,
+            default=16,
             help="Prefetch factor for train dataloader when --num-workers > 0.",
         )
         group.add_argument(
             "--valid-prefetch-factor",
             type=int,
-            default=2,
+            default=8,
             help="Prefetch factor for valid dataloader when --valid-num-workers > 0.",
         )
         group.add_argument(
             "--test-prefetch-factor",
             type=int,
-            default=2,
+            default=8,
             help="Prefetch factor for test dataloader when --num-workers > 0.",
         )
 
@@ -293,6 +571,13 @@ class MSR_AsrDataModule:
             The state dict for the training sampler.
         """
         transforms = []
+        world_size = int(getattr(self.args, "world_size", 1))
+        rank = int(getattr(self.args, "rank", 0))
+        use_ddp_pack_sampler = (
+            bool(getattr(self.args, "ddp_pack_sampler", False))
+            and world_size > 1
+            and bool(getattr(self.args, "concatenate_cuts", False))
+        )
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
             logging.info("About to get Musan cuts")
@@ -307,18 +592,28 @@ class MSR_AsrDataModule:
             logging.info("Disable MUSAN")
 
         if self.args.concatenate_cuts:
+            pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
             logging.info(
                 f"Using cut concatenation with duration factor "
-                f"{self.args.duration_factor} and gap {self.args.gap}."
+                f"{self.args.duration_factor}, gap {self.args.gap}, "
+                f"max_duration {pack_max_dur if pack_max_dur > 0 else 'None'}."
             )
-            # Cut concatenation should be the first transform in the list,
-            # so that if we e.g. mix noise in, it will fill the gaps between
-            # different utterances.
-            transforms = [
-                CutConcatenate(
-                    duration_factor=self.args.duration_factor, gap=self.args.gap
+            if use_ddp_pack_sampler:
+                logging.info(
+                    "DDP pack sampler enabled: moving CutConcatenate packing into the sampler; "
+                    "disabling dataset-side CutConcatenate."
                 )
-            ] + transforms
+            else:
+                # Cut concatenation should be the first transform in the list,
+                # so that if we e.g. mix noise in, it will fill the gaps between
+                # different utterances.
+                transforms = [
+                    CutConcatenate(
+                        duration_factor=self.args.duration_factor,
+                        gap=self.args.gap,
+                        max_duration=pack_max_dur if pack_max_dur > 0 else None,
+                    )
+                ] + transforms
 
         input_transforms = []
         if self.args.enable_spec_aug:
@@ -382,7 +677,55 @@ class MSR_AsrDataModule:
                 shuffle_buffer_size=self.args.bucketing_shuffle_buffer_size,
                 drop_last=self.args.drop_last,
             )
-            if getattr(self.args, "world_size", 1) > 1:
+            if int(self.args.max_cuts) > 0:
+                sampler_kwargs["max_cuts"] = int(self.args.max_cuts)
+            q = float(getattr(self.args, "quadratic_duration", 0.0))
+            if q > 0:
+                sampler_kwargs["quadratic_duration"] = q
+
+            if use_ddp_pack_sampler:
+                pack_max_dur = float(
+                    getattr(self.args, "concatenate_cuts_max_duration", 0.0)
+                )
+                train_sampler = PackAwareDistributedDynamicBucketingSampler(
+                    cuts_train,
+                    max_duration=float(self.args.max_duration),
+                    max_cuts=int(self.args.max_cuts) if int(self.args.max_cuts) > 0 else None,
+                    shuffle=bool(self.args.shuffle),
+                    drop_last=bool(self.args.drop_last),
+                    num_buckets=int(self.args.num_buckets),
+                    buffer_size=int(self.args.bucketing_buffer_size),
+                    shuffle_buffer_size=int(self.args.bucketing_shuffle_buffer_size),
+                    quadratic_duration=q if q > 0 else None,
+                    world_size=world_size,
+                    rank=rank,
+                    seed=int(getattr(self.args, "seed", 0)),
+                    gap=float(self.args.gap),
+                    duration_factor=float(self.args.duration_factor),
+                    pack_max_duration=pack_max_dur if pack_max_dur > 0 else None,
+                    pack_fill_strategy=str(
+                        getattr(self.args, "pack_fill_strategy", "legacy")
+                    ),
+                    pack_raw_pool_size=int(
+                        getattr(self.args, "pack_raw_pool_size", 0)
+                    ),
+                    pack_max_pieces_per_bin=int(
+                        getattr(self.args, "pack_max_pieces_per_bin", 0)
+                    ),
+                    pack_min_remaining_duration=float(
+                        getattr(self.args, "pack_min_remaining_duration", 0.5)
+                    ),
+                    pack_tail_knapsack_rem=float(
+                        getattr(self.args, "pack_tail_knapsack_rem", 5.0)
+                    ),
+                    pack_tail_knapsack_max_candidates=int(
+                        getattr(self.args, "pack_tail_knapsack_max_candidates", 128)
+                    ),
+                    pack_tail_knapsack_max_pieces=int(
+                        getattr(self.args, "pack_tail_knapsack_max_pieces", 4)
+                    ),
+                )
+            elif getattr(self.args, "world_size", 1) > 1:
                 sampler_kwargs.update(
                     world_size=int(getattr(self.args, "world_size", 1)),
                     rank=int(getattr(self.args, "rank", 0)),
@@ -394,9 +737,16 @@ class MSR_AsrDataModule:
                     sampler_kwargs["world_size"],
                     sampler_kwargs["rank"],
                 )
-            train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
+                train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
+            else:
+                train_sampler = DynamicBucketingSampler(cuts_train, **sampler_kwargs)
         else:
             logging.info("Using SimpleCutSampler.")
+            if use_ddp_pack_sampler:
+                logging.warning(
+                    "DDP pack sampler requested but bucketing sampler is disabled; "
+                    "falling back to SimpleCutSampler."
+                )
             train_sampler = SimpleCutSampler(
                 cuts_train,
                 max_duration=self.args.max_duration,
@@ -432,10 +782,13 @@ class MSR_AsrDataModule:
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
         transforms = []
-        if self.args.concatenate_cuts:
+        if getattr(self.args, "valid_concatenate_cuts", False):
+            pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
             transforms = [
                 CutConcatenate(
-                    duration_factor=self.args.duration_factor, gap=self.args.gap
+                    duration_factor=self.args.duration_factor,
+                    gap=self.args.gap,
+                    max_duration=pack_max_dur if pack_max_dur > 0 else None,
                 )
             ] + transforms
 
@@ -510,7 +863,9 @@ class MSR_AsrDataModule:
         )
         cuts_path = self.args.manifest_dir / cuts_name
         logging.info(f"About to get large subset cuts from {cuts_path}")
-        return load_manifest_lazy(cuts_path)
+        cuts = load_manifest_lazy(cuts_path)
+        self._validate_audio_path_backend(cuts, kind="train")
+        return cuts
 
     @lru_cache()
     def dev_cuts(self) -> CutSet:
@@ -519,7 +874,9 @@ class MSR_AsrDataModule:
         )
         cuts_path = self.args.manifest_dir / cuts_name
         logging.info(f"About to get dev cuts from {cuts_path}")
-        return load_manifest_lazy(cuts_path)
+        cuts = load_manifest_lazy(cuts_path)
+        self._validate_audio_path_backend(cuts, kind="valid")
+        return cuts
 
     @lru_cache()
     def test_cuts(self) -> CutSet:
@@ -528,7 +885,9 @@ class MSR_AsrDataModule:
         )
         cuts_path = self.args.manifest_dir / cuts_name
         logging.info(f"About to get the test cuts from {cuts_path}")
-        return load_manifest_lazy(cuts_path)
+        cuts = load_manifest_lazy(cuts_path)
+        self._validate_audio_path_backend(cuts, kind="test")
+        return cuts
 
 """
     @lru_cache()

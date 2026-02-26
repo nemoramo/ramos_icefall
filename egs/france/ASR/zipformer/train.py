@@ -52,6 +52,7 @@ It supports training with:
 
 
 import argparse
+import contextlib
 import copy
 import logging
 import os
@@ -100,12 +101,102 @@ from icefall.hooks import register_inf_check_hooks
 from icefall.utils import (
     AttributeDict,
     MetricsTracker,
+    encode_supervisions,
     get_parameter_groups_with_lrs,
     setup_logger,
     str2bool,
 )
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+
+def _parse_cuda_visible_devices() -> Optional[List[int]]:
+    """Return physical GPU indices listed in CUDA_VISIBLE_DEVICES if it's simple '0,1,2' form.
+
+    If CUDA_VISIBLE_DEVICES uses UUIDs or other formats, return None.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cvd:
+        return None
+    devs: List[int] = []
+    for part in cvd.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            return None
+        devs.append(int(part))
+    return devs or None
+
+
+def _query_nvidia_smi() -> Optional[Dict[int, Dict[str, float]]]:
+    """Query GPU util/mem via nvidia-smi.
+
+    Returns:
+      {gpu_index: {"util_gpu": %, "util_mem": %, "mem_used_mb": MB, "mem_total_mb": MB}}
+      or None if unavailable.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        import subprocess
+
+        indices = _parse_cuda_visible_devices()
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        if indices:
+            cmd += ["-i", ",".join(map(str, indices))]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        return None
+
+    stats: Dict[int, Dict[str, float]] = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 5:
+            continue
+        try:
+            idx = int(parts[0])
+            stats[idx] = {
+                "util_gpu": float(parts[1]),
+                "util_mem": float(parts[2]),
+                "mem_used_mb": float(parts[3]),
+                "mem_total_mb": float(parts[4]),
+            }
+        except Exception:
+            continue
+    return stats or None
+
+
+def _compute_feature_lens_list(
+    supervisions: Dict[str, Any], num_seqs: int
+) -> List[int]:
+    """Compute per-sequence frame lengths from K2SpeechRecognitionDataset supervisions.
+
+    This works for both the standard case (one supervision per sequence) and the
+    CutConcatenate packing case (multiple supervisions per sequence).
+    """
+    if num_seqs <= 0:
+        return []
+
+    seq_idx = supervisions["sequence_idx"]
+    start_frame = supervisions["start_frame"]
+    num_frames = supervisions["num_frames"]
+    if isinstance(seq_idx, torch.Tensor):
+        seq_idx = seq_idx.detach().cpu().tolist()
+        start_frame = start_frame.detach().cpu().tolist()
+        num_frames = num_frames.detach().cpu().tolist()
+
+    lens = [0] * num_seqs
+    for b, st, nf in zip(seq_idx, start_frame, num_frames):
+        b = int(b)
+        end = int(st) + int(nf)
+        if end > lens[b]:
+            lens[b] = end
+    return lens
 
 
 def get_adjusted_batch_count(params: AttributeDict) -> float:
@@ -127,6 +218,87 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
             module.batch_count = batch_count
         if hasattr(module, "name"):
             module.name = name
+
+
+def build_packed_attention_mask(
+    supervisions: Dict[str, Any],
+    seq_lens: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a dense (B, T, T) boolean mask for packed CutConcatenate batches.
+
+    The mask is block-diagonal w.r.t. original utterances (supervisions) inside
+    each packed cut. Gap/padding frames get block_id=0.
+
+    Note: This is a train-time helper; it intentionally prioritizes correctness
+    over maximum efficiency.
+    """
+    num_seqs = len(seq_lens)
+    if num_seqs == 0:
+        return torch.empty((0, 0, 0), dtype=torch.bool, device=device)
+
+    # Conv2dSubsampling reduces length as: (T - 7) // 2
+    embed_lens = [max(0, (int(L) - 7) // 2) for L in seq_lens]
+    t_max = max(embed_lens) if embed_lens else 0
+    if t_max <= 0:
+        return torch.empty((num_seqs, 0, 0), dtype=torch.bool, device=device)
+
+    # Build block ids on CPU to avoid many tiny GPU slice assignments.
+    block_id = torch.zeros((num_seqs, t_max), dtype=torch.int32)
+
+    seq_idx = supervisions["sequence_idx"]
+    start_frame = supervisions["start_frame"]
+    num_frames = supervisions["num_frames"]
+
+    if isinstance(seq_idx, torch.Tensor):
+        seq_idx = seq_idx.detach().cpu().tolist()
+        start_frame = start_frame.detach().cpu().tolist()
+        num_frames = num_frames.detach().cpu().tolist()
+
+    segs_by_seq: List[List[Tuple[int, int]]] = [[] for _ in range(num_seqs)]
+    for b, st, nf in zip(seq_idx, start_frame, num_frames):
+        b = int(b)
+        st = int(st)
+        nf = int(nf)
+        end = st + nf
+
+        # Map raw feature-frame indices to encoder-embed frame indices.
+        # We mirror Conv2dSubsampling length formula to stay consistent.
+        s = (st - 7) // 2
+        e = (end - 7) // 2
+        if s < 0:
+            s = 0
+        if e < 0:
+            e = 0
+        segs_by_seq[b].append((s, e))
+
+    for b in range(num_seqs):
+        segs = segs_by_seq[b]
+        if not segs:
+            continue
+        segs.sort(key=lambda x: x[0])
+
+        L = int(embed_lens[b])
+        if L <= 0:
+            continue
+
+        next_id = 1
+        for s, e in segs:
+            if s < 0:
+                s = 0
+            if s >= L:
+                s = L - 1
+            if e > L:
+                e = L
+            if e <= s:
+                e = min(s + 1, L)
+
+            block_id[b, s:e] = next_id
+            next_id += 1
+
+    block_id = block_id.to(device)
+    # True means masked position.
+    return block_id[:, :, None] != block_id[:, None, :]
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
@@ -329,7 +501,7 @@ def get_parser():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=32,
+        default=16,
         help="The number of training dataloader workers that "
         "collect the batches.",
     )
@@ -436,6 +608,161 @@ def get_parser():
         type=int,
         default=50,
         help="Print training stats every this many local batches.",
+    )
+    parser.add_argument(
+        "--cuda-sync-for-timing",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, call torch.cuda.synchronize() around forward/backward/step "
+            "timing points. Disable for best throughput and fewer synchronization bubbles."
+        ),
+    )
+    parser.add_argument(
+        "--enable-smi-in-train-log",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, query nvidia-smi in the training logging path. "
+            "This may add subprocess overhead and jitter."
+        ),
+    )
+    parser.add_argument(
+        "--shape-gather-interval",
+        type=int,
+        default=200,
+        help=(
+            "How often (in global train steps) to all_gather per-rank batch-shape "
+            "stats in DDP. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--skip-valid-steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, skip running validation for global train steps lower than this "
+            "value (useful for performance debugging)."
+        ),
+    )
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        type=str2bool,
+        default=True,
+        help=(
+            "Value for DDP find_unused_parameters. "
+            "Set False only if you have verified all parameters receive gradients."
+        ),
+    )
+
+    # Torch profiler (optional): useful to diagnose bubbles (e.g., dataloader stalls,
+    # DDP sync/all-reduce, unexpected CPU work). Profiling adds noticeable overhead,
+    # so keep the active window short.
+    parser.add_argument(
+        "--torch-profiler",
+        type=str2bool,
+        default=False,
+        help="Enable torch.profiler during training (best-effort).",
+    )
+    parser.add_argument(
+        "--torch-profiler-rank0-only",
+        type=str2bool,
+        default=True,
+        help="If True, enable profiler only on rank0 to reduce overhead/output.",
+    )
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        default="",
+        help="Output directory for profiler traces. If empty, use <exp_dir>/profiler.",
+    )
+    parser.add_argument(
+        "--torch-profiler-start-step",
+        type=int,
+        default=-1,
+        help=(
+            "Start profiling when global batch_idx_train reaches this value. "
+            "If <= 0, start on the next training step."
+        ),
+    )
+    parser.add_argument(
+        "--torch-profiler-wait",
+        type=int,
+        default=0,
+        help="Profiler schedule: number of steps to wait (no recording).",
+    )
+    parser.add_argument(
+        "--torch-profiler-warmup",
+        type=int,
+        default=5,
+        help="Profiler schedule: number of warmup steps (recording without trace export).",
+    )
+    parser.add_argument(
+        "--torch-profiler-active",
+        type=int,
+        default=20,
+        help="Profiler schedule: number of active steps (recording with trace export).",
+    )
+    parser.add_argument(
+        "--torch-profiler-repeat",
+        type=int,
+        default=1,
+        help="Profiler schedule: repeat count for (wait,warmup,active).",
+    )
+    parser.add_argument(
+        "--torch-profiler-record-shapes",
+        type=str2bool,
+        default=False,
+        help="If True, record tensor shapes (more overhead but easier attribution).",
+    )
+    parser.add_argument(
+        "--torch-profiler-profile-memory",
+        type=str2bool,
+        default=False,
+        help="If True, record memory usage (more overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-stack",
+        type=str2bool,
+        default=False,
+        help="If True, record Python stacks (very high overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-with-flops",
+        type=str2bool,
+        default=False,
+        help="If True, estimate FLOPs for some ops (extra overhead).",
+    )
+    parser.add_argument(
+        "--torch-profiler-export-key-averages",
+        type=str2bool,
+        default=True,
+        help="If True, export a key_averages() table to <profiler_dir>/key_averages_rank{rank}.txt.",
+    )
+    parser.add_argument(
+        "--torch-profiler-row-limit",
+        type=int,
+        default=50,
+        help="Row limit when exporting key_averages() table.",
+    )
+
+    parser.add_argument(
+        "--use-packed-supervisions",
+        type=str2bool,
+        default=True,
+        help=(
+            "If True (train-only), support CutConcatenate packing by slicing encoder outputs "
+            "per supervision segment and computing RNNT/CTC losses independently per original utterance."
+        ),
+    )
+    parser.add_argument(
+        "--pack-attn-mask",
+        type=str2bool,
+        default=True,
+        help=(
+            "If True (requires --use-packed-supervisions), build a dense per-batch "
+            "block-diagonal attention mask to prevent attention across concatenated utterances."
+        ),
     )
 
     parser.add_argument(
@@ -972,21 +1299,55 @@ def compute_loss(
       warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = next(model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
+    num_seqs = int(feature.size(0))
+    n_sup = len(supervisions.get("text", []))
+    is_packed_batch = n_sup != num_seqs
+    allow_packed = bool(getattr(params, "use_packed_supervisions", False))
+    if is_packed_batch and not allow_packed:
+        raise ValueError(
+            "Detected a packed batch (len(supervisions['text']) != inputs.size(0)) "
+            f"but --use-packed-supervisions is False. num_seqs={num_seqs}, n_sup={n_sup}. "
+            "Fix: set --use-packed-supervisions True, or disable CutConcatenate/packing."
+        )
+    # Compute per-sequence lengths. This is required when CutConcatenate packing is used
+    # (multiple supervisions per sequence), and is equivalent to num_frames in the
+    # non-packed case.
+    feature_lens_list = _compute_feature_lens_list(supervisions, num_seqs=num_seqs)
+    feature_lens = torch.tensor(feature_lens_list, device=device, dtype=torch.int64)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y)
+    use_packed = bool(is_packed_batch and allow_packed)
+    if use_packed and getattr(params, "pack_attn_mask", False) and is_training:
+        attn_mask = build_packed_attention_mask(
+            supervisions=supervisions, seq_lens=feature_lens_list, device=device
+        )
+    else:
+        attn_mask = None
+
+    packed_supervision_segments = None
+    if use_packed:
+        # Sort supervision segments by duration (descending) and re-order texts
+        # consistently. We'll compute losses independently per supervision segment.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            packed_supervision_segments, texts = encode_supervisions(
+                supervisions, subsampling_factor=params.subsampling_factor
+            )
+        y = sp.encode(texts, out_type=int)
+        y = k2.RaggedTensor(y)
+    else:
+        texts = batch["supervisions"]["text"]
+        y = sp.encode(texts, out_type=int)
+        y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
         # Newer AsrModel returns (simple_loss, pruned_loss, ctc_loss,
@@ -998,6 +1359,10 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            attn_mask=attn_mask,
+            packed_supervision_segments=packed_supervision_segments
+            if use_packed
+            else None,
         )
 
         loss = 0.0
@@ -1134,6 +1499,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
+    warned_packed_valid_wer = False
 
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
@@ -1187,6 +1553,24 @@ def compute_validation_loss(
                 params.valid_wer_max_batches > 0
                 and batch_idx >= params.valid_wer_max_batches
             ):
+                continue
+
+            # Packed validation batches are not supported for WER decoding:
+            # current greedy-search assumes 1-utterance-per-sequence.
+            inputs = batch.get("inputs")
+            supervisions = batch.get("supervisions", {})
+            num_seqs = int(inputs.size(0)) if isinstance(inputs, torch.Tensor) else 0
+            n_sup = len(supervisions.get("text", []))
+            is_packed_batch = n_sup != num_seqs
+            if is_packed_batch:
+                if not warned_packed_valid_wer:
+                    logging.warning(
+                        "Validation batch is packed (n_sup != num_seqs); skipping WER computation "
+                        "because greedy-search assumes 1-utt-per-seq. n_sup=%s num_seqs=%s",
+                        n_sup,
+                        num_seqs,
+                    )
+                    warned_packed_valid_wer = True
                 continue
 
             feature = batch["inputs"].to(device)
@@ -1327,40 +1711,205 @@ def train_one_epoch(
 
     prev_step_end = time.perf_counter()
 
+    # Optional torch.profiler to diagnose bubbles (e.g., DDP sync/all-reduce, stalls).
+    # Best-effort: if torch.profiler is not available, training continues without it.
+    prof = None
+    prof_record_fn = None
+    prof_step_count = 0
+    prof_cfg = None
+    prof_start_step = None
+    prof_total_steps = None
+    prof_dir: Optional[Path] = None
+
+    def _prof_record(name: str):
+        if prof is None or prof_record_fn is None:
+            return contextlib.nullcontext()
+        return prof_record_fn(name)
+
+    def _stop_profiler(reason: str) -> None:
+        nonlocal prof, prof_record_fn, prof_step_count
+        if prof is None:
+            return
+        try:
+            prof.stop()
+        except Exception:
+            pass
+
+        if bool(getattr(params, "torch_profiler_export_key_averages", True)) and (
+            prof_dir is not None
+        ):
+            try:
+                sort_by = (
+                    "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
+                )
+                row_limit = int(getattr(params, "torch_profiler_row_limit", 50))
+                table = prof.key_averages().table(
+                    sort_by=sort_by, row_limit=row_limit
+                )
+                out = prof_dir / f"key_averages_rank{rank}.txt"
+                out.write_text(table + "\n", encoding="utf-8")
+                logging.info("Torch profiler key averages written to %s", out)
+            except Exception as e:
+                logging.warning("Failed to export torch profiler key averages: %s", e)
+
+        logging.info("Torch profiler stopped (%s).", reason)
+        prof = None
+        prof_record_fn = None
+        prof_step_count = 0
+
+    def _profiler_step_and_maybe_stop() -> None:
+        nonlocal prof_step_count
+        if prof is None:
+            return
+        try:
+            prof.step()
+        except Exception:
+            return
+        prof_step_count += 1
+        if prof_total_steps is not None and prof_step_count >= prof_total_steps:
+            _stop_profiler("reached configured steps")
+
+    if bool(getattr(params, "torch_profiler", False)) and (
+        (not bool(getattr(params, "torch_profiler_rank0_only", True))) or rank == 0
+    ):
+        try:
+            from torch.profiler import ProfilerActivity, profile as torch_profile
+            from torch.profiler import record_function as torch_record_function
+            from torch.profiler import schedule as torch_schedule
+            from torch.profiler import tensorboard_trace_handler
+        except Exception as e:
+            logging.warning("torch.profiler import failed; disabling profiler: %s", e)
+        else:
+            wait = int(getattr(params, "torch_profiler_wait", 0))
+            warmup = int(getattr(params, "torch_profiler_warmup", 5))
+            active = int(getattr(params, "torch_profiler_active", 20))
+            repeat = int(getattr(params, "torch_profiler_repeat", 1))
+            if wait < 0 or warmup < 0 or active <= 0 or repeat <= 0:
+                logging.warning(
+                    "Invalid torch profiler schedule (wait=%s warmup=%s active=%s repeat=%s); disabling profiler.",
+                    wait,
+                    warmup,
+                    active,
+                    repeat,
+                )
+            else:
+                start_step = int(getattr(params, "torch_profiler_start_step", -1))
+                if start_step <= 0:
+                    start_step = int(params.batch_idx_train) + 1
+                prof_start_step = start_step
+                prof_total_steps = (wait + warmup + active) * repeat
+
+                out_dir = str(getattr(params, "torch_profiler_dir", "")).strip()
+                prof_dir = Path(out_dir) if out_dir else (params.exp_dir / "profiler")
+                prof_dir.mkdir(parents=True, exist_ok=True)
+
+                activities = [ProfilerActivity.CPU]
+                if torch.cuda.is_available():
+                    activities.append(ProfilerActivity.CUDA)
+
+                prof_cfg = {
+                    "torch_profile": torch_profile,
+                    "record_fn": torch_record_function,
+                    "activities": activities,
+                    "schedule": torch_schedule(
+                        wait=wait, warmup=warmup, active=active, repeat=repeat
+                    ),
+                    "on_trace_ready": tensorboard_trace_handler(
+                        str(prof_dir), worker_name=f"rank{rank}"
+                    ),
+                    "record_shapes": bool(
+                        getattr(params, "torch_profiler_record_shapes", False)
+                    ),
+                    "profile_memory": bool(
+                        getattr(params, "torch_profiler_profile_memory", False)
+                    ),
+                    "with_stack": bool(
+                        getattr(params, "torch_profiler_with_stack", False)
+                    ),
+                    "with_flops": bool(
+                        getattr(params, "torch_profiler_with_flops", False)
+                    ),
+                }
+                logging.info(
+                    "Torch profiler enabled: start_step=%s schedule=(wait=%s,warmup=%s,active=%s,repeat=%s) dir=%s",
+                    prof_start_step,
+                    wait,
+                    warmup,
+                    active,
+                    repeat,
+                    prof_dir,
+                )
+
     for batch_idx, batch in enumerate(train_dl):
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
-        compute_start = time.perf_counter()
+        compute_start = iter_start
 
         if batch_idx % 10 == 0:
             set_batch_count(model, get_adjusted_batch_count(params))
 
         params.batch_idx_train += 1
+        if (
+            prof is None
+            and prof_cfg is not None
+            and prof_start_step is not None
+            and params.batch_idx_train == prof_start_step
+        ):
+            try:
+                prof = prof_cfg["torch_profile"](
+                    activities=prof_cfg["activities"],
+                    schedule=prof_cfg["schedule"],
+                    on_trace_ready=prof_cfg["on_trace_ready"],
+                    record_shapes=prof_cfg["record_shapes"],
+                    profile_memory=prof_cfg["profile_memory"],
+                    with_stack=prof_cfg["with_stack"],
+                    with_flops=prof_cfg["with_flops"],
+                )
+                prof.start()
+                prof_record_fn = prof_cfg["record_fn"]
+                prof_step_count = 0
+                logging.info(
+                    "Torch profiler started at global_step=%s; traces under %s",
+                    params.batch_idx_train,
+                    prof_dir,
+                )
+            except Exception as e:
+                logging.warning("Failed to start torch profiler; disabling: %s", e)
+                prof = None
+                prof_record_fn = None
+                prof_cfg = None
         batch_size = len(batch["supervisions"]["text"])
 
         try:
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and bool(
+                getattr(params, "cuda_sync_for_timing", False)
+            ):
                 torch.cuda.synchronize()
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                )
+            with _prof_record("forward_loss"):
+                with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                    loss, loss_info = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=True,
+                    )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
-            scaler.scale(loss).backward()
+            with _prof_record("backward"):
+                scaler.scale(loss).backward()
             scheduler.step_batch(params.batch_idx_train)
 
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            if torch.cuda.is_available():
+            with _prof_record("optimizer_step"):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            if torch.cuda.is_available() and bool(
+                getattr(params, "cuda_sync_for_timing", False)
+            ):
                 torch.cuda.synchronize()
         except Exception as e:
             err_msg = str(e)
@@ -1381,6 +1930,7 @@ def train_one_epoch(
                     torch.cuda.empty_cache()
                 # Do not count a skipped OOM batch as an optimization step.
                 params.batch_idx_train -= 1
+                _profiler_step_and_maybe_stop()
                 continue
 
             logging.info(f"Caught exception: {e}.")
@@ -1389,6 +1939,7 @@ def train_one_epoch(
             raise
 
         if params.print_diagnostics and batch_idx == 5:
+            _stop_profiler("print_diagnostics early-exit")
             return False
 
         if (
@@ -1445,22 +1996,24 @@ def train_one_epoch(
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
             iter_end = time.perf_counter()
-            iter_time = iter_end - iter_start
             compute_time = iter_end - compute_start
+            step_time = data_time + compute_time
             batch_audio_sec = 0.0
             if batch["supervisions"]["num_frames"] is not None:
                 batch_audio_sec = (
                     float(batch["supervisions"]["num_frames"].float().sum().item())
                     / 100.0
                 )
-            batch_time_ms = iter_time * 1000.0
+            batch_time_ms = step_time * 1000.0
             data_time_ms = data_time * 1000.0
             compute_time_ms = compute_time * 1000.0
             speed_utt = (
-                batch_size / max(iter_time, 1e-6) if batch_size > 0 else 0.0
+                batch_size / max(step_time, 1e-6) if batch_size > 0 else 0.0
             )
             speed_audio = (
-                batch_audio_sec / max(iter_time, 1e-6) if batch_audio_sec > 0 else 0.0
+                batch_audio_sec / max(step_time, 1e-6)
+                if batch_audio_sec > 0
+                else 0.0
             )
             if torch.cuda.is_available():
                 gpu_mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
@@ -1483,6 +2036,193 @@ def train_one_epoch(
                 f"gmem={gpu_mem_alloc_mb:.1f}/{gpu_mem_reserved_mb:.1f}MB, "
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
+
+            # Per-rank batch shape stats to help diagnose DDP imbalance.
+            try:
+                inputs = batch.get("inputs")
+                if isinstance(inputs, torch.Tensor) and inputs.ndim == 3:
+                    nseq, t, c = inputs.shape
+                else:
+                    nseq, t, c = 0, 0, 0
+
+                supervisions = batch.get("supervisions", {})
+                lens_list = _compute_feature_lens_list(supervisions, num_seqs=nseq)
+                lens_max = max(lens_list) if lens_list else 0
+                lens_sum = sum(lens_list) if lens_list else 0
+                n_sup = len(supervisions.get("text", []))
+                speech_frames = 0
+                num_frames = supervisions.get("num_frames", None)
+                if isinstance(num_frames, torch.Tensor):
+                    speech_frames = int(num_frames.detach().sum().item())
+                elif num_frames is not None:
+                    try:
+                        speech_frames = int(sum(int(x) for x in num_frames))
+                    except Exception:
+                        speech_frames = 0
+                total_frames = int(nseq) * int(t)
+
+                is_packed_batch = int(n_sup) != int(nseq)
+                use_packed = is_packed_batch and bool(
+                    getattr(params, "use_packed_supervisions", False)
+                )
+                mask_t = 0
+                if use_packed and bool(getattr(params, "pack_attn_mask", False)):
+                    # Conv2dSubsampling reduces length as: (T - 7) // 2
+                    mask_t = max(0, (int(lens_max) - 7) // 2)
+
+                shape_gather_interval = int(getattr(params, "shape_gather_interval", 200))
+                do_shape_gather = (
+                    shape_gather_interval > 0
+                    and params.batch_idx_train % shape_gather_interval == 0
+                )
+
+                if world_size > 1 and dist.is_initialized() and do_shape_gather:
+                    backend = dist.get_backend()
+                    use_cuda_gather = torch.cuda.is_available() and backend == "nccl"
+                    dev = (
+                        next(model.parameters()).device
+                        if use_cuda_gather
+                        else torch.device("cpu")
+                    )
+                    stats = torch.tensor(
+                        [
+                            nseq,
+                            t,
+                            c,
+                            n_sup,
+                            lens_max,
+                            lens_sum,
+                            mask_t,
+                            speech_frames,
+                            total_frames,
+                        ],
+                        device=dev,
+                        dtype=torch.int64,
+                    )
+                    gathered = [torch.empty_like(stats) for _ in range(world_size)]
+                    dist.all_gather(gathered, stats)
+
+                    if rank == 0:
+                        parts: List[str] = []
+                        for r, g in enumerate(gathered):
+                            (
+                                nseq_r,
+                                t_r,
+                                c_r,
+                                n_sup_r,
+                                lens_max_r,
+                                lens_sum_r,
+                                mask_t_r,
+                                speech_frames_r,
+                                total_frames_r,
+                            ) = g.tolist()
+                            nonpad_ratio_r = (
+                                float(lens_sum_r) / float(total_frames_r)
+                                if total_frames_r > 0
+                                else 0.0
+                            )
+                            speech_ratio_r = (
+                                float(speech_frames_r) / float(total_frames_r)
+                                if total_frames_r > 0
+                                else 0.0
+                            )
+                            parts.append(
+                                f"r{r}:x=({nseq_r},{t_r},{c_r}) "
+                                f"lens_max={lens_max_r} lens_sum={lens_sum_r} "
+                                f"sup={n_sup_r} mask_t={mask_t_r} "
+                                f"nonpad_ratio={nonpad_ratio_r:.3f} "
+                                f"speech_ratio={speech_ratio_r:.3f}"
+                            )
+                        logging.info("Per-rank batch shape: " + " | ".join(parts))
+
+                        if tb_writer is not None:
+                            for r, g in enumerate(gathered):
+                                (
+                                    nseq_r,
+                                    t_r,
+                                    _c_r,
+                                    n_sup_r,
+                                    lens_max_r,
+                                    lens_sum_r,
+                                    mask_t_r,
+                                    speech_frames_r,
+                                    total_frames_r,
+                                ) = g.tolist()
+                                nonpad_ratio_r = (
+                                    float(lens_sum_r) / float(total_frames_r)
+                                    if total_frames_r > 0
+                                    else 0.0
+                                )
+                                speech_ratio_r = (
+                                    float(speech_frames_r) / float(total_frames_r)
+                                    if total_frames_r > 0
+                                    else 0.0
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_nseq_rank{r}",
+                                    nseq_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_T_rank{r}",
+                                    t_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_sup_rank{r}",
+                                    n_sup_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_lens_max_rank{r}",
+                                    lens_max_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_lens_sum_rank{r}",
+                                    lens_sum_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_pack_mask_t_rank{r}",
+                                    mask_t_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_nonpad_ratio_rank{r}",
+                                    nonpad_ratio_r,
+                                    params.batch_idx_train,
+                                )
+                                tb_writer.add_scalar(
+                                    f"train/batch_speech_ratio_rank{r}",
+                                    speech_ratio_r,
+                                    params.batch_idx_train,
+                                )
+                elif world_size <= 1 or not dist.is_initialized():
+                    nonpad_ratio = (
+                        float(lens_sum) / float(total_frames) if total_frames > 0 else 0.0
+                    )
+                    speech_ratio = (
+                        float(speech_frames) / float(total_frames)
+                        if total_frames > 0
+                        else 0.0
+                    )
+                    logging.info(
+                        "Batch shape: x=(%s,%s,%s) lens_max=%s lens_sum=%s sup=%s mask_t=%s "
+                        "nonpad_ratio=%.3f speech_ratio=%.3f",
+                        nseq,
+                        t,
+                        c,
+                        lens_max,
+                        lens_sum,
+                        n_sup,
+                        mask_t,
+                        nonpad_ratio,
+                        speech_ratio,
+                    )
+            except Exception:
+                # Keep training robust; shape stats are best-effort.
+                pass
 
             if tb_writer is not None:
                 tb_writer.add_scalar(
@@ -1512,6 +2252,29 @@ def train_one_epoch(
                     gpu_mem_reserved_mb,
                     params.batch_idx_train,
                 )
+                # GPU utilization curve (from nvidia-smi). Best-effort only.
+                smi = (
+                    _query_nvidia_smi()
+                    if bool(getattr(params, "enable_smi_in_train_log", False))
+                    else None
+                )
+                if smi:
+                    idxs = sorted(smi.keys())
+                    util_avg = sum(smi[i]["util_gpu"] for i in idxs) / max(1, len(idxs))
+                    tb_writer.add_scalar(
+                        "train/gpu_util_avg", util_avg, params.batch_idx_train
+                    )
+                    for i in idxs:
+                        tb_writer.add_scalar(
+                            f"train/gpu_util_gpu{i}",
+                            smi[i]["util_gpu"],
+                            params.batch_idx_train,
+                        )
+                        tb_writer.add_scalar(
+                            f"train/gpu_mem_used_mb_gpu{i}",
+                            smi[i]["mem_used_mb"],
+                            params.batch_idx_train,
+                        )
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
@@ -1525,10 +2288,11 @@ def train_one_epoch(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
                     )
 
-        prev_step_end = time.perf_counter()
+        _profiler_step_and_maybe_stop()
         if (
             params.batch_idx_train > 0
             and params.batch_idx_train % params.valid_interval == 0
+            and params.batch_idx_train >= int(getattr(params, "skip_valid_steps", 0))
             and not params.print_diagnostics
         ):
             logging.info("Computing validation loss")
@@ -1565,6 +2329,10 @@ def train_one_epoch(
                 f"Reached max_train_steps={params.max_train_steps}; stopping training loop."
             )
             break
+        prev_step_end = time.perf_counter()
+
+    if prof is not None:
+        _stop_profiler("epoch_end")
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
@@ -1674,8 +2442,11 @@ def run(rank, world_size, args):
 
     model.to(device)
     if world_size > 1:
-        logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        ddp_find_unused = bool(getattr(params, "ddp_find_unused_parameters", True))
+        logging.info("Using DDP (find_unused_parameters=%s)", ddp_find_unused)
+        model = DDP(
+            model, device_ids=[rank], find_unused_parameters=ddp_find_unused
+        )
 
     logging.info("Rank %s: building optimizer parameter groups", rank)
     param_groups = get_parameter_groups_with_lrs(

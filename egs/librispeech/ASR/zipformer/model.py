@@ -123,7 +123,10 @@ class AsrModel(nn.Module):
             assert attention_decoder is None
 
     def forward_encoder(
-        self, x: torch.Tensor, x_lens: torch.Tensor
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute encoder outputs.
         Args:
@@ -146,12 +149,78 @@ class AsrModel(nn.Module):
         src_key_padding_mask = make_pad_mask(x_lens)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
-        encoder_out, encoder_out_lens = self.encoder(x, x_lens, src_key_padding_mask)
+        encoder_out, encoder_out_lens = self.encoder(
+            x, x_lens, src_key_padding_mask, attn_mask=attn_mask
+        )
 
         encoder_out = encoder_out.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
         assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
 
         return encoder_out, encoder_out_lens
+
+    @staticmethod
+    def _slice_encoder_out(
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        supervision_segments: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Slice encoder_out by supervision segments (train-only packing helper).
+
+        Args:
+          encoder_out:
+            Tensor of shape (B, T, C).
+          encoder_out_lens:
+            Tensor of shape (B,).
+          supervision_segments:
+            Int tensor of shape (S, 3) with columns:
+              - sequence_idx (0..B-1)
+              - start_frame (in encoder_out frame units)
+              - num_frames (in encoder_out frame units)
+
+        Returns:
+          sliced_out:
+            Tensor of shape (S, Tmax, C) (padded).
+          sliced_out_lens:
+            Tensor of shape (S,).
+        """
+        assert supervision_segments.ndim == 2 and supervision_segments.size(1) == 3, (
+            supervision_segments.shape
+        )
+        assert encoder_out.ndim == 3, encoder_out.shape
+        assert encoder_out_lens.ndim == 1, encoder_out_lens.shape
+
+        device = encoder_out.device
+        seg = supervision_segments.to(device=device, dtype=torch.long)
+        if seg.numel() == 0:
+            return encoder_out.new_zeros(
+                (0, 0, encoder_out.size(-1))
+            ), encoder_out_lens.new_zeros((0,))
+
+        seq_idx = seg[:, 0]
+        start = seg[:, 1]
+        length = torch.clamp_min(seg[:, 2], 1)
+
+        enc_lens = torch.clamp_min(encoder_out_lens.to(device=device, dtype=torch.long), 1)
+        seq_len = enc_lens[seq_idx]
+
+        start = torch.clamp_min(start, 0)
+        start = torch.minimum(start, seq_len - 1)
+        end = torch.minimum(start + length, seq_len)
+        end = torch.maximum(end, start + 1)
+
+        sliced_lens = end - start
+        t_max = int(sliced_lens.max().item())
+
+        frame_off = torch.arange(t_max, device=device).unsqueeze(0)  # (1, Tmax)
+        frame_idx = start.unsqueeze(1) + frame_off  # (S, Tmax)
+        valid = frame_off < sliced_lens.unsqueeze(1)
+        frame_idx = torch.minimum(frame_idx, (seq_len - 1).unsqueeze(1))
+
+        seq_idx_2d = seq_idx.unsqueeze(1).expand(-1, t_max)
+        sliced_out = encoder_out[seq_idx_2d, frame_idx, :]  # (S, Tmax, C)
+        sliced_out = sliced_out * valid.unsqueeze(-1).to(dtype=sliced_out.dtype)
+
+        return sliced_out, sliced_lens.to(dtype=encoder_out_lens.dtype)
 
     def forward_ctc(
         self,
@@ -346,6 +415,8 @@ class AsrModel(nn.Module):
         supervision_segments: Optional[torch.Tensor] = None,
         time_warp_factor: Optional[int] = 80,
         return_encoder_out: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+        packed_supervision_segments: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Args:
@@ -400,7 +471,19 @@ class AsrModel(nn.Module):
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axes
 
-        assert x.size(0) == x_lens.size(0) == y.dim0, (x.shape, x_lens.shape, y.dim0)
+        assert x.size(0) == x_lens.size(0), (x.shape, x_lens.shape)
+        if packed_supervision_segments is None:
+            assert x.size(0) == y.dim0, (x.shape, y.dim0)
+        else:
+            assert (
+                packed_supervision_segments.ndim == 2
+                and packed_supervision_segments.size(1) == 3
+            ), packed_supervision_segments.shape
+            assert packed_supervision_segments.size(0) == y.dim0, (
+                packed_supervision_segments.shape,
+                y.dim0,
+            )
+            assert not use_cr_ctc, "packed_supervision_segments is not supported with CR-CTC"
 
         device = x.device
 
@@ -435,8 +518,17 @@ class AsrModel(nn.Module):
                 x_lens = x_lens.repeat(2)
                 y_for_seq = k2.ragged.cat([y, y], axis=0)
 
-        # Compute encoder outputs
-        encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens)
+        # Compute encoder outputs (optionally with external attention mask).
+        encoder_out, encoder_out_lens = self.forward_encoder(
+            x, x_lens, attn_mask=attn_mask
+        )
+
+        encoder_out_for_loss = encoder_out
+        encoder_out_lens_for_loss = encoder_out_lens
+        if packed_supervision_segments is not None:
+            encoder_out_for_loss, encoder_out_lens_for_loss = self._slice_encoder_out(
+                encoder_out, encoder_out_lens, packed_supervision_segments
+            )
 
         row_splits = y_for_seq.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
@@ -444,8 +536,8 @@ class AsrModel(nn.Module):
         if self.use_transducer:
             # Compute transducer loss
             simple_loss, pruned_loss = self.forward_transducer(
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
+                encoder_out=encoder_out_for_loss,
+                encoder_out_lens=encoder_out_lens_for_loss,
                 y=y_for_seq.to(device),
                 y_lens=y_lens,
                 prune_range=prune_range,
@@ -464,8 +556,8 @@ class AsrModel(nn.Module):
             targets = y_for_seq.values
             if not use_cr_ctc:
                 ctc_loss = self.forward_ctc(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
+                    encoder_out=encoder_out_for_loss,
+                    encoder_out_lens=encoder_out_lens_for_loss,
                     targets=targets,
                     target_lengths=y_lens,
                 )
@@ -500,8 +592,8 @@ class AsrModel(nn.Module):
 
         if self.use_attention_decoder:
             attention_decoder_loss = self.attention_decoder.calc_att_loss(
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
+                encoder_out=encoder_out_for_loss,
+                encoder_out_lens=encoder_out_lens_for_loss,
                 ys=y_for_seq.to(device),
                 ys_lens=y_lens.to(device),
             )
