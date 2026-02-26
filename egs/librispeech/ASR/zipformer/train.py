@@ -1058,6 +1058,28 @@ def compute_validation_loss(
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
 
+    # Make validation deterministic w.r.t. chunking.
+    #
+    # In causal mode, Zipformer2 randomly chooses chunk_size from a list during
+    # training to simulate streaming. For validation we fix it to a single value:
+    #   - if -1 is present, use -1 (no chunking)
+    #   - otherwise, use the first provided value
+    encoder = getattr(asr_model, "encoder", None)
+    orig_chunk_size = None
+    if encoder is not None and getattr(encoder, "causal", False) and hasattr(
+        encoder, "chunk_size"
+    ):
+        try:
+            cs = encoder.chunk_size
+            cs_list = [cs] if isinstance(cs, int) else list(cs)
+            if len(cs_list) > 0:
+                chosen = -1 if (-1 in cs_list) else cs_list[0]
+                orig_chunk_size = encoder.chunk_size
+                encoder.chunk_size = (int(chosen),)
+        except Exception:
+            # Best-effort only; keep validation robust.
+            orig_chunk_size = None
+
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
     ) -> Tuple[int, int, int, int, int]:
@@ -1081,54 +1103,60 @@ def compute_validation_loss(
         errs = ins + dels + subs
         return errs, ref_len, ins, dels, subs
 
-    with torch.no_grad():
-        for _, batch in enumerate(valid_dl):
-            if params.compute_valid_wer:
-                _, info, encoder_out, encoder_out_lens = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=False,
-                    return_encoder_out=True,
-                )
-            else:
-                _, info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=False,
-                )
-
-            tot_loss = tot_loss + info
-
-            if params.compute_valid_wer:
-                texts = batch["supervisions"]["text"]
-                if params.use_transducer:
-                    hyp_tokens = greedy_search_batch(
-                        model=asr_model,
-                        encoder_out=encoder_out,
-                        encoder_out_lens=encoder_out_lens,
+    try:
+        with torch.no_grad():
+            for _, batch in enumerate(valid_dl):
+                if params.compute_valid_wer:
+                    _, info, encoder_out, encoder_out_lens = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=False,
+                        return_encoder_out=True,
                     )
                 else:
-                    ctc_output = asr_model.ctc_output(encoder_out)
-                    hyp_tokens = ctc_greedy_search(
-                        ctc_output=ctc_output,
-                        encoder_out_lens=encoder_out_lens,
-                        blank_id=params.blank_id,
+                    _, info = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=False,
                     )
 
-                hyp_texts = sp.decode(hyp_tokens)
-                hyp_words = [h.split() for h in hyp_texts]
-                ref_words = [t.split() for t in texts]
+                tot_loss = tot_loss + info
 
-                errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_words, hyp_words)
-                tot_errs += errs
-                tot_ref_len += ref_len
-                tot_ins += ins
-                tot_del += dels
-                tot_sub += subs
+                if params.compute_valid_wer:
+                    texts = batch["supervisions"]["text"]
+                    if params.use_transducer:
+                        hyp_tokens = greedy_search_batch(
+                            model=asr_model,
+                            encoder_out=encoder_out,
+                            encoder_out_lens=encoder_out_lens,
+                        )
+                    else:
+                        ctc_output = asr_model.ctc_output(encoder_out)
+                        hyp_tokens = ctc_greedy_search(
+                            ctc_output=ctc_output,
+                            encoder_out_lens=encoder_out_lens,
+                            blank_id=params.blank_id,
+                        )
+
+                    hyp_texts = sp.decode(hyp_tokens)
+                    hyp_words = [h.split() for h in hyp_texts]
+                    ref_words = [t.split() for t in texts]
+
+                    errs, ref_len, ins, dels, subs = _compute_wer_stats(
+                        ref_words, hyp_words
+                    )
+                    tot_errs += errs
+                    tot_ref_len += ref_len
+                    tot_ins += ins
+                    tot_del += dels
+                    tot_sub += subs
+    finally:
+        if orig_chunk_size is not None and encoder is not None:
+            encoder.chunk_size = orig_chunk_size
 
     if world_size > 1:
         tot_loss.reduce(device)

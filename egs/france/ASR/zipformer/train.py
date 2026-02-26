@@ -1501,6 +1501,28 @@ def compute_validation_loss(
     device = next(asr_model.parameters()).device
     warned_packed_valid_wer = False
 
+    # Make validation deterministic w.r.t. chunking.
+    #
+    # In causal mode, Zipformer2 randomly chooses chunk_size from a list during
+    # training to simulate streaming. For validation we fix it to a single value:
+    #   - if -1 is present, use -1 (no chunking)
+    #   - otherwise, use the first provided value
+    encoder = getattr(asr_model, "encoder", None)
+    orig_chunk_size = None
+    if encoder is not None and getattr(encoder, "causal", False) and hasattr(
+        encoder, "chunk_size"
+    ):
+        try:
+            cs = encoder.chunk_size
+            cs_list = [cs] if isinstance(cs, int) else list(cs)
+            if len(cs_list) > 0:
+                chosen = -1 if (-1 in cs_list) else cs_list[0]
+                orig_chunk_size = encoder.chunk_size
+                encoder.chunk_size = (int(chosen),)
+        except Exception:
+            # Best-effort only; keep validation robust.
+            orig_chunk_size = None
+
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
     ) -> Tuple[int, int, int, int, int]:
@@ -1535,75 +1557,81 @@ def compute_validation_loss(
         return " ".join(text.split())
 
     valid_start = time.perf_counter()
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(valid_dl):
-            loss, loss_info = compute_loss(
-                params=params,
-                model=model,
-                sp=sp,
-                batch=batch,
-                is_training=False,
-            )
-            assert loss.requires_grad is False
-            tot_loss = tot_loss + loss_info
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(valid_dl):
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                )
+                assert loss.requires_grad is False
+                tot_loss = tot_loss + loss_info
 
-            if not params.compute_valid_wer:
-                continue
-            if (
-                params.valid_wer_max_batches > 0
-                and batch_idx >= params.valid_wer_max_batches
-            ):
-                continue
+                if not params.compute_valid_wer:
+                    continue
+                if (
+                    params.valid_wer_max_batches > 0
+                    and batch_idx >= params.valid_wer_max_batches
+                ):
+                    continue
 
-            # Packed validation batches are not supported for WER decoding:
-            # current greedy-search assumes 1-utterance-per-sequence.
-            inputs = batch.get("inputs")
-            supervisions = batch.get("supervisions", {})
-            num_seqs = int(inputs.size(0)) if isinstance(inputs, torch.Tensor) else 0
-            n_sup = len(supervisions.get("text", []))
-            is_packed_batch = n_sup != num_seqs
-            if is_packed_batch:
-                if not warned_packed_valid_wer:
-                    logging.warning(
-                        "Validation batch is packed (n_sup != num_seqs); skipping WER computation "
-                        "because greedy-search assumes 1-utt-per-seq. n_sup=%s num_seqs=%s",
-                        n_sup,
-                        num_seqs,
+                # Packed validation batches are not supported for WER decoding:
+                # current greedy-search assumes 1-utterance-per-sequence.
+                inputs = batch.get("inputs")
+                supervisions = batch.get("supervisions", {})
+                num_seqs = int(inputs.size(0)) if isinstance(inputs, torch.Tensor) else 0
+                n_sup = len(supervisions.get("text", []))
+                is_packed_batch = n_sup != num_seqs
+                if is_packed_batch:
+                    if not warned_packed_valid_wer:
+                        logging.warning(
+                            "Validation batch is packed (n_sup != num_seqs); skipping WER computation "
+                            "because greedy-search assumes 1-utt-per-seq. n_sup=%s num_seqs=%s",
+                            n_sup,
+                            num_seqs,
+                        )
+                        warned_packed_valid_wer = True
+                    continue
+
+                feature = batch["inputs"].to(device)
+                feature_lens = batch["supervisions"]["num_frames"].to(device)
+                encoder_out, encoder_out_lens = asr_model.forward_encoder(
+                    feature, feature_lens
+                )
+
+                if params.use_transducer:
+                    hyp_tokens = greedy_search_batch(
+                        model=asr_model,
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
                     )
-                    warned_packed_valid_wer = True
-                continue
+                else:
+                    ctc_output = asr_model.ctc_output(encoder_out)
+                    hyp_tokens = ctc_greedy_search(
+                        ctc_output=ctc_output,
+                        encoder_out_lens=encoder_out_lens,
+                        blank_id=params.blank_id,
+                    )
 
-            feature = batch["inputs"].to(device)
-            feature_lens = batch["supervisions"]["num_frames"].to(device)
-            encoder_out, encoder_out_lens = asr_model.forward_encoder(feature, feature_lens)
+                hyp_texts = [_normalize_wer_text(text) for text in sp.decode(hyp_tokens)]
+                ref_words = [
+                    _normalize_wer_text(text).split()
+                    for text in batch["supervisions"]["text"]
+                ]
+                hyp_words = [text.split() for text in hyp_texts]
 
-            if params.use_transducer:
-                hyp_tokens = greedy_search_batch(
-                    model=asr_model,
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                )
-            else:
-                ctc_output = asr_model.ctc_output(encoder_out)
-                hyp_tokens = ctc_greedy_search(
-                    ctc_output=ctc_output,
-                    encoder_out_lens=encoder_out_lens,
-                    blank_id=params.blank_id,
-                )
-
-            hyp_texts = [_normalize_wer_text(text) for text in sp.decode(hyp_tokens)]
-            ref_words = [
-                _normalize_wer_text(text).split()
-                for text in batch["supervisions"]["text"]
-            ]
-            hyp_words = [text.split() for text in hyp_texts]
-
-            errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_words, hyp_words)
-            tot_errs += errs
-            tot_ref_len += ref_len
-            tot_ins += ins
-            tot_del += dels
-            tot_sub += subs
+                errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_words, hyp_words)
+                tot_errs += errs
+                tot_ref_len += ref_len
+                tot_ins += ins
+                tot_del += dels
+                tot_sub += subs
+    finally:
+        if orig_chunk_size is not None and encoder is not None:
+            encoder.chunk_size = orig_chunk_size
 
     valid_time = time.perf_counter() - valid_start
     logging.info(
