@@ -15,15 +15,15 @@ from train_impl import *  # noqa: F401,F403
 from icefall.training.zipformer.trainer import run_zipformer_training
 
 
-def main() -> None:
+def main(argv=None) -> None:
     # Preserve existing CLI flags by reusing the recipe parser and datamodule args.
     run_zipformer_training(
         get_parser=_impl.get_parser,
         add_data_arguments=_impl.MSR_AsrDataModule.add_arguments,
         worker_fn=_impl.run,
+        argv=argv,
     )
 
 
 if __name__ == "__main__":
     main()
-

@@ -15,15 +15,15 @@ from train_impl import *  # noqa: F401,F403
 from icefall.training.zipformer.trainer import run_zipformer_training
 
 
-def main() -> None:
+def main(argv=None) -> None:
     # Keep defaults identical by reusing the original recipe parser/datamodule.
     run_zipformer_training(
         get_parser=_impl.get_parser,
         add_data_arguments=_impl.LibriSpeechAsrDataModule.add_arguments,
         worker_fn=_impl.run,
+        argv=argv,
     )
 
 
 if __name__ == "__main__":
     main()
-
