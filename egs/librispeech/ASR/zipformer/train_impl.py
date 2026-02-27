@@ -507,7 +507,17 @@ def get_parser():
         "--compute-valid-wer",
         type=str2bool,
         default=False,
-        help="Whether to compute WER during validation.",
+        help="Whether to compute an error rate (WER/CER) during validation.",
+    )
+    parser.add_argument(
+        "--valid-error-rate",
+        type=str,
+        default="wer",
+        choices=["wer", "cer"],
+        help=(
+            "Validation error rate type when --compute-valid-wer is enabled. "
+            "'wer' splits on whitespace; 'cer' uses characters (spaces removed)."
+        ),
     )
 
     parser.add_argument(
@@ -1057,6 +1067,9 @@ def compute_validation_loss(
 
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
+    valid_error_rate = str(getattr(params, "valid_error_rate", "wer")).strip().lower()
+    if valid_error_rate not in ("wer", "cer"):
+        raise ValueError(f"Unsupported valid_error_rate={valid_error_rate!r}; use 'wer' or 'cer'.")
 
     def _compute_wer_stats(
         refs: List[List[str]], hyps: List[List[str]]
@@ -1080,6 +1093,13 @@ def compute_validation_loss(
             ref_len += len(ref)
         errs = ins + dels + subs
         return errs, ref_len, ins, dels, subs
+
+    def _tokenize_error_rate_text(text: str) -> List[str]:
+        t = str(text).strip()
+        if valid_error_rate == "wer":
+            return t.split()
+        # CER: remove spaces and operate on characters.
+        return list(t.replace(" ", ""))
 
     with torch.no_grad():
         for _, batch in enumerate(valid_dl):
@@ -1120,10 +1140,10 @@ def compute_validation_loss(
                     )
 
                 hyp_texts = sp.decode(hyp_tokens)
-                hyp_words = [h.split() for h in hyp_texts]
-                ref_words = [t.split() for t in texts]
+                hyp_tokens = [_tokenize_error_rate_text(h) for h in hyp_texts]
+                ref_tokens = [_tokenize_error_rate_text(t) for t in texts]
 
-                errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_words, hyp_words)
+                errs, ref_len, ins, dels, subs = _compute_wer_stats(ref_tokens, hyp_tokens)
                 tot_errs += errs
                 tot_ref_len += ref_len
                 tot_ins += ins
@@ -1150,7 +1170,8 @@ def compute_validation_loss(
     if params.compute_valid_wer:
         denom = max(1, tot_ref_len)
         wer_stats = {
-            "wer": tot_errs / denom,
+            "metric": valid_error_rate,
+            valid_error_rate: tot_errs / denom,
             "errors": float(tot_errs),
             "ref_len": float(tot_ref_len),
             "ins": float(tot_ins),
@@ -1364,8 +1385,10 @@ def train_one_epoch(
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if wer_stats is not None:
+                metric = str(wer_stats.get("metric", "wer")).strip().lower()
+                metric_value = float(wer_stats.get(metric, wer_stats.get("wer", 0.0)))
                 logging.info(
-                    f"[valid] %WER {wer_stats['wer']:.2%} "
+                    f"[valid] %{metric.upper()} {metric_value:.2%} "
                     f"[{int(wer_stats['errors'])} / {int(wer_stats['ref_len'])}, "
                     f"{int(wer_stats['ins'])} ins, {int(wer_stats['del'])} del, "
                     f"{int(wer_stats['sub'])} sub ]"
@@ -1379,7 +1402,9 @@ def train_one_epoch(
                 )
                 if wer_stats is not None:
                     tb_writer.add_scalar(
-                        "train/valid_wer", wer_stats["wer"], params.batch_idx_train
+                        f"train/valid_{metric}",
+                        metric_value,
+                        params.batch_idx_train,
                     )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]

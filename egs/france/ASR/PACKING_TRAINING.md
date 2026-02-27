@@ -117,6 +117,7 @@ PACKING_METHOD=lhotse_legacy ./run_french_150M.sh
 - `--valid-interval 1000`
 - `--compute-valid-wer 1`
 - `--valid-wer-max-batches 100`
+- `--valid-error-rate wer`（可选：`cer`）
 - `--wer-lowercase 1`
 
 注意：validation 默认不做 packing（避免改变验证语义）。
