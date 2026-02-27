@@ -192,7 +192,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _load_omegaconf(config_paths: Sequence[str], overrides: Sequence[str]) -> Any:
-    from omegaconf import OmegaConf
+    try:
+        from omegaconf import OmegaConf
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Missing dependency: omegaconf. Install it via `pip install omegaconf` "
+            "(or `pip install -r requirements.txt`)."
+        ) from e
 
     cfg = OmegaConf.create()
     for p in config_paths:
@@ -291,4 +297,3 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
