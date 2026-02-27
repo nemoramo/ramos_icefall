@@ -44,7 +44,7 @@ from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
 
-from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
+from icefall.dataset.pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
 
 
 class _SeedWorkers:
