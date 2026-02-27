@@ -11,6 +11,7 @@
 
 - 固定 `--max-cuts`（例如 50）来保证每步 shape 更稳定。
 - 固定 `--concatenate-cuts-max-duration 30` 来限制单条 packed cut 的计算量/显存。
+- `bestfit/knapsack` 模式下需满足：`--max-duration >= --max-cuts * --concatenate-cuts-max-duration`（否则会直接报错）。
 - 再通过扫 `--max-duration`（例如 1500 -> 1800 -> 2100 -> 2400）把显存/利用率推满。
 
 ## 2. Packing 方法（简化参数）
@@ -40,6 +41,7 @@
 
 - `--max-cuts > 0`：需要固定每 rank 的 packed cut 数，才能让每步 shape 稳定。
 - `--concatenate-cuts-max-duration > 0`：需要明确每条 packed cut 的上限（秒）。
+- `--max-duration >= --max-cuts * --concatenate-cuts-max-duration`：raw_best_fit* 下每步输出条数主要由 `max_cuts` 决定；该约束保证 `max-duration` 仍然是严格上界（避免 OOM/语义混乱）。
 
 ## 3. 推荐默认参数（当前 france recipe）
 
@@ -118,6 +120,7 @@ PACKING_METHOD=lhotse_legacy ./run_french_150M.sh
 - `--wer-lowercase 1`
 
 注意：validation 默认不做 packing（避免改变验证语义）。
+如果你显式打开了 packing（例如 `--valid-concatenate-cuts 1`），validation 仍可算 loss，但会跳过 WER（greedy-search 路径假设 1-utt-per-seq）。
 
 ## 7. 关键参数说明与调参建议
 
@@ -151,3 +154,21 @@ Sampler 混洗与 I/O 并发：
 数据后端（默认 TOS）：
 
 - `--audio-path-backend`：默认 `tos`，会抽样检查 cuts 里音频路径必须以 `--tos-mount-prefix` 开头；本地盘数据用 `local`，调试用 `auto`（跳过检查）。
+
+## 8. 流式 Chunk-based 训练与 packing 的 attention mask 说明
+
+1) 当 `chunk_size != -1` 时，`Zipformer2` 会生成 **chunkwise attention mask**（不是简单的下三角 causal），其约束是“只能看当前 chunk + 左侧若干 chunks”：
+
+- `egs/librispeech/ASR/zipformer/zipformer.py` 里满足 `src_c > tgt_c`（未来 chunk）或 `src_c < tgt_c - left_context_chunks`（太久远的历史）的注意力会被 mask 掉。
+
+2) packing 训练时（CutConcatenate），我们构建的是 **packed block-diagonal mask**（不同 supervision 段之间互相全禁）。它会与 chunk mask 做 `logical_or` 合并：
+
+- `True = masked`，因此 OR 等价于“允许集合取交集”：既要满足 chunk 约束，又要满足 block-diagonal 约束。
+
+3) chunk 边界与每条 utterance 的对齐方式在 packing 与非 packing 下不完全一致：
+
+- chunk mask 的 chunk 划分按 packed 序列的绝对时间 `t=0..T-1` 来切；
+- packing 后每个 supervision 段起点 `s` 往往不在 `chunk_size` 的整数倍上，因此“这条 utterance 的第一个 chunk”会带一个随机 offset（开头可能是一个“残 chunk”）；
+- 不 packing 时，每条 utterance 都从 `t=0` 开始，所以 chunk 边界天然对齐到 utterance 开头（末尾 chunk 仍可能不满，两者都一样）。
+
+通常这类差异影响很小，更像一种 random chunk offset augmentation；建议在实验记录中说明 packing 是否开启以及对应的 chunk 参数即可。

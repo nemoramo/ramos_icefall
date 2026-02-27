@@ -751,7 +751,7 @@ def get_parser():
         type=str2bool,
         default=True,
         help=(
-            "If True (train-only), support CutConcatenate packing by slicing encoder outputs "
+            "If True, support CutConcatenate packing by slicing encoder outputs "
             "per supervision segment and computing RNNT/CTC losses independently per original utterance."
         ),
     )
@@ -760,7 +760,7 @@ def get_parser():
         type=str2bool,
         default=True,
         help=(
-            "If True (requires --use-packed-supervisions), build a dense per-batch "
+            "If True (train-time; requires --use-packed-supervisions), build a dense per-batch "
             "block-diagonal attention mask to prevent attention across concatenated utterances."
         ),
     )
@@ -1309,15 +1309,26 @@ def compute_loss(
     # Compute per-sequence lengths. This is required when CutConcatenate packing is used
     # (multiple supervisions per sequence), and is equivalent to num_frames in the
     # non-packed case.
-    num_seqs = feature.size(0)
+    num_seqs = int(feature.size(0))
+    n_sup = len(supervisions.get("text", []))
+    is_packed_batch = n_sup != num_seqs
+
+    allow_packed = bool(getattr(params, "use_packed_supervisions", False))
+    if is_packed_batch and not allow_packed:
+        raise ValueError(
+            "Detected a packed batch (len(supervisions['text']) != inputs.size(0)) "
+            f"but --use-packed-supervisions is False. "
+            f"num_seqs={num_seqs}, n_sup={n_sup}. "
+            "Fix: set --use-packed-supervisions True, or disable CutConcatenate/packing."
+        )
     feature_lens_list = _compute_feature_lens_list(supervisions, num_seqs=num_seqs)
     feature_lens = torch.tensor(feature_lens_list, device=device, dtype=torch.int64)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    use_packed = is_training and getattr(params, "use_packed_supervisions", False)
-    if use_packed and getattr(params, "pack_attn_mask", False):
+    use_packed = is_packed_batch and allow_packed
+    if use_packed and bool(getattr(params, "pack_attn_mask", False)) and is_training:
         attn_mask = build_packed_attention_mask(
             supervisions=supervisions, seq_lens=feature_lens_list, device=device
         )
@@ -1335,7 +1346,7 @@ def compute_loss(
         y = sp.encode(texts, out_type=int)
         y = k2.RaggedTensor(y)
     else:
-        texts = batch["supervisions"]["text"]
+        texts = supervisions["text"]
         y = sp.encode(texts, out_type=int)
         y = k2.RaggedTensor(y)
 
@@ -1523,6 +1534,8 @@ def compute_validation_loss(
             text = text.lower()
         return " ".join(text.split())
 
+    warned_packed_wer = False
+
     valid_start = time.perf_counter()
     with torch.no_grad():
         for batch_idx, batch in enumerate(valid_dl):
@@ -1542,6 +1555,28 @@ def compute_validation_loss(
                 params.valid_wer_max_batches > 0
                 and batch_idx >= params.valid_wer_max_batches
             ):
+                continue
+
+            # Detect packed validation batch (WER path not supported).
+            supervisions = batch.get("supervisions", {})
+            inputs = batch.get("inputs")
+            if isinstance(inputs, torch.Tensor):
+                num_seqs = int(inputs.size(0))
+            else:
+                num_seqs = 0
+            n_sup = len(supervisions.get("text", []))
+            is_packed_batch = n_sup != num_seqs
+
+            if is_packed_batch:
+                if not warned_packed_wer:
+                    logging.warning(
+                        "Validation batches appear to be packed (n_sup != num_seqs). "
+                        "Skipping WER computation because greedy-search assumes 1-utt-per-seq. "
+                        "n_sup=%s num_seqs=%s",
+                        n_sup,
+                        num_seqs,
+                    )
+                    warned_packed_wer = True
                 continue
 
             feature = batch["inputs"].to(device)
@@ -2033,8 +2068,13 @@ def train_one_epoch(
                 total_frames = int(nseq) * int(t)
 
                 use_packed = bool(getattr(params, "use_packed_supervisions", False))
+                is_packed_batch = int(n_sup) != int(nseq)
                 mask_t = 0
-                if use_packed and bool(getattr(params, "pack_attn_mask", False)):
+                if (
+                    is_packed_batch
+                    and use_packed
+                    and bool(getattr(params, "pack_attn_mask", False))
+                ):
                     # Conv2dSubsampling reduces length as: (T - 7) // 2
                     mask_t = max(0, (int(lens_max) - 7) // 2)
 
