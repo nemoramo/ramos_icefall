@@ -39,3 +39,4 @@ node_modules
 
 # Local-only agent instructions / contributor notes (do not commit)
 AGENTS.md
+.claude
