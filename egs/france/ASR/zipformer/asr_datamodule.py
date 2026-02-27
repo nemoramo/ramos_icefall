@@ -22,7 +22,7 @@ import inspect
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
@@ -45,6 +45,7 @@ from torch.utils.data import DataLoader
 from icefall.utils import str2bool
 
 from icefall.dataset.pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
+from icefall.dataset.audio_backend import validate_audio_path_backend
 
 
 class _SeedWorkers:
@@ -150,71 +151,13 @@ class MSR_AsrDataModule:
                     "--concatenate-cuts-max-duration > 0 (packed cut upper bound in seconds)."
                 )
 
-    def _iter_first_n(self, cuts: CutSet, n: int) -> Iterable[Any]:
-        if n <= 0:
-            return []
-        it = iter(cuts)
-        out = []
-        for _ in range(int(n)):
-            try:
-                out.append(next(it))
-            except StopIteration:
-                break
-        return out
-
-    def _get_first_audio_source(self, cut: Any) -> Optional[str]:
-        try:
-            rec = getattr(cut, "recording", None)
-            if rec is None:
-                return None
-            sources = getattr(rec, "sources", None)
-            if not sources:
-                return None
-            src = getattr(sources[0], "source", None)
-            if src is None:
-                return None
-            return str(src)
-        except Exception:
-            return None
-
     def _validate_audio_path_backend(self, cuts: CutSet, *, kind: str) -> None:
-        backend = str(getattr(self.args, "audio_path_backend", "auto")).strip().lower()
-        n = int(getattr(self.args, "audio_path_check_cuts", 20))
-        if n <= 0 or backend in ("auto", "any", "local"):
-            return
-
-        if backend != "tos":
-            logging.warning(
-                "Unknown audio_path_backend=%s (kind=%s); skipping checks.",
-                backend,
-                kind,
-            )
-            return
-
-        prefix = str(getattr(self.args, "tos_mount_prefix", "/mnt/asr-audio-data")).rstrip(
-            "/"
-        )
-        checked = 0
-        for cut in self._iter_first_n(cuts, n):
-            checked += 1
-            src = self._get_first_audio_source(cut)
-            if src is None:
-                continue
-            if src == prefix or src.startswith(prefix + "/"):
-                continue
-            raise ValueError(
-                f"audio-path-backend=tos but found a non-TOS audio source in {kind} cuts: {src}\n"
-                f"Expected prefix: {prefix}\n"
-                "If your data is local, set --audio-path-backend local.\n"
-                "Otherwise, regenerate manifests with TOS-mounted audio paths."
-            )
-
-        logging.info(
-            "Audio path backend check: backend=%s kind=%s checked=%d prefix=%s",
-            backend,
-            kind,
-            checked,
-            prefix,
+        validate_audio_path_backend(
+            cuts,
+            backend=str(getattr(self.args, "audio_path_backend", "auto")),
+            tos_mount_prefix=str(getattr(self.args, "tos_mount_prefix", "/mnt/asr-audio-data")),
+            num_cuts=int(getattr(self.args, "audio_path_check_cuts", 20)),
+            kind=kind,
         )
 
     @classmethod
