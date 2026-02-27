@@ -1,0 +1,35 @@
+# Example: unified Zipformer YAML config for the France recipe.
+#
+# Usage (from repo root):
+#   python3 -m icefall.training.zipformer.yaml_entrypoint --config egs/france/ASR/conf/train.yaml
+#   python3 -m icefall.training.zipformer.yaml_entrypoint --config egs/france/ASR/conf/train.yaml --set ddp.world_size=8
+#
+# You can put most recipe flags under `cli:` using argparse dest names (underscore form).
+# They will be converted to `--kebab-case` flags.
+
+recipe:
+  # The working directory that the original recipe expects (relative paths resolve from here).
+  work_dir: egs/france/ASR
+  # The recipe entrypoint to import/call (relative to work_dir).
+  entrypoint: zipformer/train.py
+
+ddp:
+  world_size: 1
+  dist_backend: nccl
+  master_port: 12354
+
+exp:
+  exp_dir: zipformer/exp
+
+# Extra recipe flags. Keys without leading `--` become `--key-with-dashes`.
+cli:
+  # Dynamic bucketing
+  max_duration: 1500
+  max_cuts: 50
+
+  # Packing presets
+  packing_method: knapsack
+  concatenate_cuts_max_duration: 30
+  use_packed_supervisions: true
+  pack_attn_mask: true
+

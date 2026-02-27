@@ -13,5 +13,5 @@ __all__ = [
     "packing",
     "trainer",
     "wer",
+    "yaml_entrypoint",
 ]
-
