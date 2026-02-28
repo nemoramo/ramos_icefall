@@ -13,5 +13,6 @@ __all__ = [
     "packing",
     "trainer",
     "wer",
+    "hydra_entrypoint",
     "yaml_entrypoint",
 ]

@@ -1,0 +1,5 @@
+ddp:
+  world_size: 1
+  dist_backend: nccl
+  master_port: 12354
+

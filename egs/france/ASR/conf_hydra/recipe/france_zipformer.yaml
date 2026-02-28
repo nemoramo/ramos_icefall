@@ -1,0 +1,6 @@
+recipe:
+  # The working directory that the original recipe expects (relative paths resolve from here).
+  work_dir: egs/france/ASR
+  # The recipe entrypoint to import/call (relative to work_dir).
+  entrypoint: zipformer/train.py
+

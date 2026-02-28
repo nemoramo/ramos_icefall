@@ -1,0 +1,33 @@
+# Example: Hydra config for the unified Zipformer entrypoint.
+#
+# Usage (from repo root):
+#   python3 -m icefall.training.zipformer.hydra_entrypoint \
+#     --config-path egs/france/ASR/conf_hydra --config-name config
+#
+# Overrides examples (Hydra syntax):
+#   ddp=ws8
+#   packing=none
+#   cli.max_duration=1800
+#   exp.exp_dir=zipformer/exp/my_run
+
+defaults:
+  - _self_
+  - recipe: france_zipformer
+  - ddp: ws1
+  - packing: knapsack
+
+exp:
+  # Recommend using a unique directory per run to avoid overwriting config dumps.
+  exp_dir: zipformer/exp/hydra_${now:%Y%m%d_%H%M%S}
+
+cli:
+  # Dynamic bucketing
+  max_duration: 1500
+  max_cuts: 50
+
+  # Validation error rate (WER/CER)
+  compute_valid_wer: true
+  valid_error_rate: wer
+  valid_wer_max_batches: 100
+  wer_lowercase: true
+
