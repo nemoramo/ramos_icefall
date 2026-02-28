@@ -45,8 +45,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from lhotse.dataset.signal_transforms import time_warp as time_warp_impl
 from packaging import version
-from pypinyin import lazy_pinyin, pinyin
-from pypinyin.contrib.tone_convert import to_finals, to_finals_tone, to_initials
 from torch.utils.tensorboard import SummaryWriter
 
 from icefall.checkpoint import average_checkpoints
@@ -54,6 +52,23 @@ from icefall.checkpoint import average_checkpoints
 Pathlike = Union[str, Path]
 
 TORCH_VERSION = version.parse(torch.__version__)
+
+# NOTE: pypinyin is only required for Chinese text processing utilities
+# (e.g., text_to_pinyin). Most recipes (e.g., English ASR) should not fail
+# at import-time if pypinyin is not installed.
+try:
+    from pypinyin import lazy_pinyin, pinyin  # type: ignore
+    from pypinyin.contrib.tone_convert import (  # type: ignore
+        to_finals,
+        to_finals_tone,
+        to_initials,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    lazy_pinyin = None  # type: ignore[assignment]
+    pinyin = None  # type: ignore[assignment]
+    to_finals = None  # type: ignore[assignment]
+    to_finals_tone = None  # type: ignore[assignment]
+    to_initials = None  # type: ignore[assignment]
 
 
 def create_grad_scaler(device="cuda", **kwargs):
@@ -1756,6 +1771,18 @@ def text_to_pinyin(
       output: ['x', 'iǎng', 'ch', 'ī', 'KFC']  # mode=partial_with_tone; errors=default
       output: ['x', 'iang', 'ch', 'i', 'KFC']  # mode=partial_no_tone; errors=default
     """
+
+    if (
+        lazy_pinyin is None
+        or pinyin is None
+        or to_initials is None
+        or to_finals is None
+        or to_finals_tone is None
+    ):
+        raise ImportError(
+            "text_to_pinyin() requires optional dependency 'pypinyin'. "
+            "Install it with: pip install pypinyin"
+        )
 
     assert mode in (
         "full_with_tone",
