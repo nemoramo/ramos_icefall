@@ -1,6 +1,5 @@
-cli:
-  packing_method: knapsack
-  concatenate_cuts_max_duration: 30
-  use_packed_supervisions: true
-  pack_attn_mask: true
-
+# @package cli
+packing_method: knapsack
+concatenate_cuts_max_duration: 30
+use_packed_supervisions: true
+pack_attn_mask: true

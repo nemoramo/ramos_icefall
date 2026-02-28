@@ -1,3 +1,2 @@
-cli:
-  packing_method: none
-
+# @package cli
+packing_method: none
