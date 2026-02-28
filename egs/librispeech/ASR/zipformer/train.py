@@ -1768,6 +1768,35 @@ def main():
     world_size = args.world_size
     assert world_size >= 1
     if world_size > 1:
+        # Avoid failing DDP init with "EADDRINUSE" when the chosen master port is
+        # already occupied by another job on the same host.
+        if "MASTER_PORT" not in os.environ:
+            import socket
+
+            def _port_is_available(port: int) -> bool:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        s.bind(("", port))
+                    except OSError:
+                        return False
+                return True
+
+            def _find_free_port() -> int:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", 0))
+                    return int(s.getsockname()[1])
+
+            if not _port_is_available(args.master_port):
+                new_port = _find_free_port()
+                print(
+                    f"MASTER_PORT {args.master_port} is already in use; "
+                    f"switching to {new_port}"
+                )
+                args.master_port = new_port
+
+            os.environ["MASTER_PORT"] = str(args.master_port)
+
         mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
     else:
         run(rank=0, world_size=1, args=args)
