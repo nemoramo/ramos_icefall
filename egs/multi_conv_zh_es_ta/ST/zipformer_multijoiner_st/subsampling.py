@@ -301,6 +301,11 @@ class Conv2dSubsampling(nn.Module):
           - a tensor of shape (N, (T-7)//2, odim)
           - output lengths, of shape (batch_size,)
         """
+        # On-the-fly feature extraction may produce an off-by-one mismatch between the
+        # actual padded feature length (x.size(1)) and metadata-derived x_lens.
+        # Clamp to keep x_lens consistent with x and avoid rare assertion crashes.
+        x_lens = x_lens.clamp(max=x.size(1))
+
         # On entry, x is (N, T, idim)
         x = x.unsqueeze(1)  # (N, T, idim) -> (N, 1, T, idim) i.e., (N, C, H, W)
         # scaling x by 0.1 allows us to use a larger grad-scale in fp16 "amp" (automatic mixed precision)
@@ -351,6 +356,9 @@ class Conv2dSubsampling(nn.Module):
           - updated cache
         """
         # On entry, x is (N, T, idim)
+        # See comment in non-streaming forward().
+        x_lens = x_lens.clamp(max=x.size(1))
+
         x = x.unsqueeze(1)  # (N, T, idim) -> (N, 1, T, idim) i.e., (N, C, H, W)
 
         # T' = (T-7)//2
