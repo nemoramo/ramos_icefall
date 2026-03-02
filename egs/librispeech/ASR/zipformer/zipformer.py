@@ -1756,6 +1756,21 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         if attn_mask is not None:
             assert attn_mask.dtype == torch.bool
+            # Packed/chunked paths may produce a mask off by 1 after subsampling.
+            # Align to attention score shape (pad with False, clip if longer).
+            target_q, target_k = attn_scores.shape[-2], attn_scores.shape[-1]
+            if (
+                attn_mask.shape[-2] != target_q
+                or attn_mask.shape[-1] != target_k
+            ):
+                aligned_shape = attn_mask.shape[:-2] + (target_q, target_k)
+                aligned_mask = torch.zeros(
+                    aligned_shape, dtype=torch.bool, device=attn_mask.device
+                )
+                q = min(attn_mask.shape[-2], target_q)
+                k = min(attn_mask.shape[-1], target_k)
+                aligned_mask[..., :q, :k] = attn_mask[..., :q, :k]
+                attn_mask = aligned_mask
             # use -1000 to avoid nan's where attn_mask and key_padding_mask make
             # all scores zero.  It's important that this be large enough that exp(-1000)
             # is exactly zero, for reasons related to const_attention_rate, it
