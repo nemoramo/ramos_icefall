@@ -68,6 +68,55 @@ python egs/france/ASR/local/replace_cut_source_prefix.py \
 
 它可以把包含 `audio_filepath` + `duration` (+ 文本字段) 的 JSONL 转为 Lhotse cuts JSONL.GZ。
 
+### 混合外部 JSONL 数据（含随机混合）
+
+如果需要把外部 jsonl（例如：
+`/mnt/asr-audio-data/users/yufeng.ma/lemas_dataset/manifests/train/en/en_all.nemo.wav16k.jsonl`）
+与现有 train cuts 混合，建议分两步：
+
+1. 先把外部 jsonl 转成 cuts；
+2. 再用流式随机混合脚本合并到新的 train cuts。
+
+新增脚本：
+
+- `egs/france/ASR/local/mix_cuts_manifests.py`
+
+示例（建议默认）：
+
+```bash
+# 1) 外部 jsonl -> cuts
+python egs/france/ASR/local/json_to_lhotse_cuts_fast.py \
+  --input-json /mnt/asr-audio-data/users/yufeng.ma/lemas_dataset/manifests/train/en/en_all.nemo.wav16k.jsonl \
+  --output-cuts /path/to/manifests/lemas_en_train_cuts.jsonl.gz \
+  --id-prefix lemas-en- \
+  --text-field original_text \
+  --fallback-text-field text \
+  --text-norm none \
+  --max-duration 30 \
+  --drop-empty-text 1
+
+# 2) 与现有 train cuts 随机混合（权重示例：原始:新增=3:1）
+python egs/france/ASR/local/mix_cuts_manifests.py \
+  --input-cuts /path/to/manifests/current_train_cuts.jsonl.gz /path/to/manifests/lemas_en_train_cuts.jsonl.gz \
+  --weights 3,1 \
+  --output-cuts /path/to/manifests/train_cuts_mixed_v1.jsonl.gz \
+  --buffer-size 20000 \
+  --seed 777 \
+  --max-duration 30 \
+  --attach-source-tag 1
+```
+
+文本字段建议：
+
+- 优先使用 `original_text`，回退到 `text`；
+- 默认 `--text-norm none`，先不做统一小写/去标点，避免和现有数据风格不一致；
+- 如果后续验证发现不稳定，再单独试 `lower` 或 `lower_no_punc` 做对照实验。
+
+随机性说明：
+
+- `mix_cuts_manifests.py` 在构建 manifest 阶段做一次随机混合（可复现，受 `--seed` 控制）；
+- 训练阶段 `DynamicBucketingSampler` 还会继续按 buffer 做 shuffle，因此整体随机性是叠加的。
+
 ## I/O 基准：FUSE 挂载 vs 直连 TOS API
 
 用于对比：
@@ -85,4 +134,3 @@ python egs/france/ASR/local/replace_cut_source_prefix.py \
 - `TOS_SECRET_ACCESS_KEY`
 - `TOS_ENDPOINT`（S3 兼容 endpoint，例如 `https://tos-s3-<region>.ivolces.com`）
 - `TOS_REGION`
-

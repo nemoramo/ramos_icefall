@@ -54,6 +54,7 @@ It supports training with:
 import argparse
 import contextlib
 import copy
+import json
 import logging
 import os
 import time
@@ -301,6 +302,75 @@ def build_packed_attention_mask(
     return block_id[:, :, None] != block_id[:, None, :]
 
 
+def _resolve_rank_phase_profile_out(params: AttributeDict) -> Path:
+    out = str(getattr(params, "rank_phase_profile_out", "")).strip()
+    if out:
+        return Path(out)
+    return params.exp_dir / "rank_phase_profile.jsonl"
+
+
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=True) + "\n")
+
+
+def _phase_summary(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "spread": 0.0,
+            "spread_ratio": 0.0,
+        }
+    mn = min(values)
+    mx = max(values)
+    mean = sum(values) / float(len(values))
+    spread = mx - mn
+    return {
+        "min": float(mn),
+        "max": float(mx),
+        "mean": float(mean),
+        "spread": float(spread),
+        "spread_ratio": float(spread / max(mean, 1.0e-6)),
+    }
+
+
+def _infer_wait_attribution(
+    phase_summary: Dict[str, Dict[str, float]], threshold: float = 0.25
+) -> str:
+    candidate_keys = ["encoder", "rnnt_path", "backward", "optim"]
+    best_key = "mixed_or_small_skew"
+    best_ratio = 0.0
+    for key in candidate_keys:
+        ratio = float(phase_summary.get(key, {}).get("spread_ratio", 0.0))
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_key = key
+    if best_ratio < threshold:
+        return "mixed_or_small_skew"
+    if best_key == "encoder":
+        return "encoder_dominated"
+    if best_key == "rnnt_path":
+        return "decoder_rnnt_dominated"
+    if best_key == "backward":
+        return "ddp_sync_dominated"
+    if best_key == "optim":
+        return "optimizer_dominated"
+    return "mixed_or_small_skew"
+
+
+def _update_topk_slowest(
+    topk_records: List[Dict[str, Any]], record: Dict[str, Any], topk: int
+) -> None:
+    if topk <= 0:
+        return
+    topk_records.append(record)
+    topk_records.sort(key=lambda x: float(x.get("step_ms_mean", 0.0)), reverse=True)
+    del topk_records[topk:]
+
+
 def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--num-encoder-layers",
@@ -438,6 +508,17 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=str2bool,
         default=False,
         help="If True, use causal version of model.",
+    )
+    parser.add_argument(
+        "--use-flash-attention-train",
+        type=str2bool,
+        default=False,
+        help=(
+            # Experimental feature: keep this train-only to avoid changing
+            # validation/inference/export behavior.
+            "If True, try Flash/SDPA attention in Zipformer encoder layers during "
+            "training only. Validation/eval/export always use legacy attention."
+        ),
     )
 
     parser.add_argument(
@@ -634,6 +715,48 @@ def get_parser():
         help=(
             "How often (in global train steps) to all_gather per-rank batch-shape "
             "stats in DDP. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--rank-phase-profile",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, gather per-rank phase timings (encoder/rnnt/backward/optim) "
+            "to diagnose cross-rank waiting in DDP."
+        ),
+    )
+    parser.add_argument(
+        "--rank-phase-profile-interval",
+        type=int,
+        default=50,
+        help=(
+            "How often (in global train steps) to all_gather per-rank phase timings. "
+            "Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--rank-phase-profile-topk",
+        type=int,
+        default=20,
+        help="Keep this many slowest gathered profiling steps in memory (rank0 only).",
+    )
+    parser.add_argument(
+        "--rank-phase-profile-out",
+        type=str,
+        default="",
+        help=(
+            "JSONL output path for gathered rank-phase profiling. "
+            "If empty, use <exp_dir>/rank_phase_profile.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--rank-phase-profile-cuda-sync",
+        type=str2bool,
+        default=False,
+        help=(
+            "If True, synchronize CUDA before phase timing capture for accuracy. "
+            "May reduce throughput; diagnostics-only."
         ),
     )
     parser.add_argument(
@@ -1079,6 +1202,9 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         causal=params.causal,
         chunk_size=_to_int_tuple(params.chunk_size),
         left_context_frames=_to_int_tuple(params.left_context_frames),
+        use_flash_attention_train=bool(
+            getattr(params, "use_flash_attention_train", False)
+        ),
     )
     return encoder
 
@@ -1280,7 +1406,8 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
+    return_phase_stats: bool = False,
+) -> Union[Tuple[Tensor, MetricsTracker], Tuple[Tensor, MetricsTracker, Dict[str, float]]]:
     """
     Compute loss given the model and its inputs.
 
@@ -1348,22 +1475,51 @@ def compute_loss(
         texts = batch["supervisions"]["text"]
         y = sp.encode(texts, out_type=int)
         y = k2.RaggedTensor(y)
+    row_splits = y.shape.row_splits(1)
+    y_lens = row_splits[1:] - row_splits[:-1]
+    phase_timing: Dict[str, float] = {}
 
     with torch.set_grad_enabled(is_training):
         # Newer AsrModel returns (simple_loss, pruned_loss, ctc_loss,
         # attention_decoder_loss, cr_loss). We don't use CR-CTC here, so ignore it.
-        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, _cr_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-            attn_mask=attn_mask,
-            packed_supervision_segments=packed_supervision_segments
-            if use_packed
-            else None,
-        )
+        if return_phase_stats:
+            model_out = model(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+                attn_mask=attn_mask,
+                packed_supervision_segments=packed_supervision_segments
+                if use_packed
+                else None,
+                return_timing=True,
+                timing_cuda_sync=bool(
+                    getattr(params, "rank_phase_profile_cuda_sync", False)
+                ),
+            )
+            (
+                simple_loss,
+                pruned_loss,
+                ctc_loss,
+                attention_decoder_loss,
+                _cr_loss,
+                phase_timing,
+            ) = model_out
+        else:
+            simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, _cr_loss = model(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+                attn_mask=attn_mask,
+                packed_supervision_segments=packed_supervision_segments
+                if use_packed
+                else None,
+            )
 
         loss = 0.0
 
@@ -1406,6 +1562,33 @@ def compute_loss(
     if params.use_attention_decoder:
         info["attn_decoder_loss"] = attention_decoder_loss.detach().cpu().item()
 
+    if return_phase_stats:
+        token_sum = int(y_lens.sum().item()) if y_lens.numel() > 0 else 0
+        token_max = int(y_lens.max().item()) if y_lens.numel() > 0 else 0
+        token_mean = (
+            float(token_sum) / float(y_lens.numel()) if y_lens.numel() > 0 else 0.0
+        )
+        lens_sum = int(sum(feature_lens_list))
+        total_frames = int(num_seqs) * int(feature.size(1))
+        nonpad_ratio = (
+            float(lens_sum) / float(total_frames) if total_frames > 0 else 0.0
+        )
+        phase_stats = {
+            "forward_total_ms": float(phase_timing.get("forward_total_ms", 0.0)),
+            "encoder_ms": float(phase_timing.get("encoder_ms", 0.0)),
+            "rnnt_path_ms": float(phase_timing.get("rnnt_path_ms", 0.0)),
+            "ctc_ms": float(phase_timing.get("ctc_ms", 0.0)),
+            "attn_decoder_ms": float(phase_timing.get("attn_decoder_ms", 0.0)),
+            "token_sum": float(token_sum),
+            "token_max": float(token_max),
+            "token_mean": float(token_mean),
+            "packed_sup_count": float(n_sup),
+            "batch_nseq": float(num_seqs),
+            "batch_T": float(feature.size(1)),
+            "lens_sum": float(lens_sum),
+            "nonpad_ratio": float(nonpad_ratio),
+        }
+        return loss, info, phase_stats
     return loss, info
 
 
@@ -1868,6 +2051,25 @@ def train_one_epoch(
                     prof_dir,
                 )
 
+    rank_phase_profile_enabled = bool(getattr(params, "rank_phase_profile", False))
+    rank_phase_profile_interval = int(
+        getattr(params, "rank_phase_profile_interval", 50)
+    )
+    rank_phase_profile_topk = int(getattr(params, "rank_phase_profile_topk", 20))
+    rank_phase_profile_out = _resolve_rank_phase_profile_out(params)
+    rank_phase_profile_sync = bool(
+        getattr(params, "rank_phase_profile_cuda_sync", False)
+    )
+    rank_phase_topk_records: List[Dict[str, Any]] = []
+    if rank_phase_profile_enabled and rank == 0:
+        logging.info(
+            "Rank phase profiling enabled: interval=%s topk=%s out=%s sync=%s",
+            rank_phase_profile_interval,
+            rank_phase_profile_topk,
+            rank_phase_profile_out,
+            rank_phase_profile_sync,
+        )
+
     for batch_idx, batch in enumerate(train_dl):
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
@@ -1907,6 +2109,9 @@ def train_one_epoch(
                 prof_record_fn = None
                 prof_cfg = None
         batch_size = len(batch["supervisions"]["text"])
+        phase_stats: Dict[str, float] = {}
+        backward_time_ms = 0.0
+        optim_time_ms = 0.0
 
         try:
             if torch.cuda.is_available() and bool(
@@ -1915,26 +2120,46 @@ def train_one_epoch(
                 torch.cuda.synchronize()
             with _prof_record("forward_loss"):
                 with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                    loss, loss_info = compute_loss(
-                        params=params,
-                        model=model,
-                        sp=sp,
-                        batch=batch,
-                        is_training=True,
-                    )
+                    if rank_phase_profile_enabled:
+                        loss, loss_info, phase_stats = compute_loss(
+                            params=params,
+                            model=model,
+                            sp=sp,
+                            batch=batch,
+                            is_training=True,
+                            return_phase_stats=True,
+                        )
+                    else:
+                        loss, loss_info = compute_loss(
+                            params=params,
+                            model=model,
+                            sp=sp,
+                            batch=batch,
+                            is_training=True,
+                        )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
+            backward_start = time.perf_counter()
             with _prof_record("backward"):
                 scaler.scale(loss).backward()
+            if rank_phase_profile_enabled:
+                if rank_phase_profile_sync and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                backward_time_ms = (time.perf_counter() - backward_start) * 1000.0
             scheduler.step_batch(params.batch_idx_train)
 
+            optim_start = time.perf_counter()
             with _prof_record("optimizer_step"):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+            if rank_phase_profile_enabled:
+                if rank_phase_profile_sync and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                optim_time_ms = (time.perf_counter() - optim_start) * 1000.0
             if torch.cuda.is_available() and bool(
                 getattr(params, "cuda_sync_for_timing", False)
             ):
@@ -2020,36 +2245,223 @@ def train_one_epoch(
                 save_bad_model()
                 raise_grad_scale_is_too_small_error(cur_grad_scale)
 
+        iter_end = time.perf_counter()
+        compute_time = iter_end - compute_start
+        step_time = data_time + compute_time
+        batch_audio_sec = 0.0
+        if batch["supervisions"]["num_frames"] is not None:
+            batch_audio_sec = (
+                float(batch["supervisions"]["num_frames"].float().sum().item()) / 100.0
+            )
+        batch_time_ms = step_time * 1000.0
+        data_time_ms = data_time * 1000.0
+        compute_time_ms = compute_time * 1000.0
+        speed_utt = batch_size / max(step_time, 1e-6) if batch_size > 0 else 0.0
+        speed_audio = (
+            batch_audio_sec / max(step_time, 1e-6) if batch_audio_sec > 0 else 0.0
+        )
+        if torch.cuda.is_available():
+            gpu_mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            gpu_mem_reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+        else:
+            gpu_mem_alloc_mb = 0.0
+            gpu_mem_reserved_mb = 0.0
+
+        do_rank_phase_profile = (
+            rank_phase_profile_enabled
+            and rank_phase_profile_interval > 0
+            and params.batch_idx_train % rank_phase_profile_interval == 0
+        )
+        if do_rank_phase_profile:
+            try:
+                local_stats = [
+                    float(rank),
+                    float(params.batch_idx_train),
+                    float(data_time_ms),
+                    float(compute_time_ms),
+                    float(batch_time_ms),
+                    float(phase_stats.get("forward_total_ms", 0.0)),
+                    float(phase_stats.get("encoder_ms", 0.0)),
+                    float(phase_stats.get("rnnt_path_ms", 0.0)),
+                    float(phase_stats.get("ctc_ms", 0.0)),
+                    float(phase_stats.get("attn_decoder_ms", 0.0)),
+                    float(backward_time_ms),
+                    float(optim_time_ms),
+                    float(phase_stats.get("token_sum", 0.0)),
+                    float(phase_stats.get("token_max", 0.0)),
+                    float(phase_stats.get("token_mean", 0.0)),
+                    float(phase_stats.get("lens_sum", 0.0)),
+                    float(phase_stats.get("nonpad_ratio", 0.0)),
+                    float(phase_stats.get("batch_nseq", 0.0)),
+                    float(phase_stats.get("batch_T", 0.0)),
+                    float(phase_stats.get("packed_sup_count", 0.0)),
+                ]
+                if world_size > 1 and dist.is_initialized():
+                    backend = dist.get_backend()
+                    use_cuda_gather = torch.cuda.is_available() and backend == "nccl"
+                    gather_dev = (
+                        next(model.parameters()).device
+                        if use_cuda_gather
+                        else torch.device("cpu")
+                    )
+                    local_tensor = torch.tensor(
+                        local_stats, dtype=torch.float64, device=gather_dev
+                    )
+                    gathered_tensors = [
+                        torch.empty_like(local_tensor) for _ in range(world_size)
+                    ]
+                    dist.all_gather(gathered_tensors, local_tensor)
+                    if rank == 0:
+                        per_rank_phase: List[Dict[str, float]] = []
+                        for g in gathered_tensors:
+                            vals = g.detach().cpu().tolist()
+                            per_rank_phase.append(
+                                {
+                                    "rank": int(vals[0]),
+                                    "step": int(vals[1]),
+                                    "data_ms": float(vals[2]),
+                                    "compute_ms": float(vals[3]),
+                                    "step_ms": float(vals[4]),
+                                    "forward_total_ms": float(vals[5]),
+                                    "encoder_ms": float(vals[6]),
+                                    "rnnt_path_ms": float(vals[7]),
+                                    "ctc_ms": float(vals[8]),
+                                    "attn_decoder_ms": float(vals[9]),
+                                    "backward_ms": float(vals[10]),
+                                    "optim_ms": float(vals[11]),
+                                    "token_sum": float(vals[12]),
+                                    "token_max": float(vals[13]),
+                                    "token_mean": float(vals[14]),
+                                    "lens_sum": float(vals[15]),
+                                    "nonpad_ratio": float(vals[16]),
+                                    "batch_nseq": float(vals[17]),
+                                    "batch_T": float(vals[18]),
+                                    "packed_sup_count": float(vals[19]),
+                                }
+                            )
+                        phase_summary = {
+                            "encoder": _phase_summary(
+                                [r["encoder_ms"] for r in per_rank_phase]
+                            ),
+                            "rnnt_path": _phase_summary(
+                                [r["rnnt_path_ms"] for r in per_rank_phase]
+                            ),
+                            "backward": _phase_summary(
+                                [r["backward_ms"] for r in per_rank_phase]
+                            ),
+                            "optim": _phase_summary(
+                                [r["optim_ms"] for r in per_rank_phase]
+                            ),
+                            "step": _phase_summary(
+                                [r["step_ms"] for r in per_rank_phase]
+                            ),
+                        }
+                        attribution = _infer_wait_attribution(phase_summary)
+                        profile_record = {
+                            "record_type": "rank_phase_profile",
+                            "step": int(params.batch_idx_train),
+                            "epoch": int(params.cur_epoch),
+                            "world_size": int(world_size),
+                            "attribution": attribution,
+                            "phase_summary": phase_summary,
+                            "per_rank": per_rank_phase,
+                        }
+                        _append_jsonl(rank_phase_profile_out, profile_record)
+                        _update_topk_slowest(
+                            rank_phase_topk_records,
+                            {
+                                "step": int(params.batch_idx_train),
+                                "epoch": int(params.cur_epoch),
+                                "attribution": attribution,
+                                "step_ms_mean": float(
+                                    phase_summary["step"]["mean"]
+                                ),
+                                "step_ms_spread": float(
+                                    phase_summary["step"]["spread"]
+                                ),
+                                "encoder_spread_ratio": float(
+                                    phase_summary["encoder"]["spread_ratio"]
+                                ),
+                                "rnnt_spread_ratio": float(
+                                    phase_summary["rnnt_path"]["spread_ratio"]
+                                ),
+                                "backward_spread_ratio": float(
+                                    phase_summary["backward"]["spread_ratio"]
+                                ),
+                            },
+                            rank_phase_profile_topk,
+                        )
+                        logging.info(
+                            "Rank-phase step=%s attr=%s spread(ms): enc=%.1f rnnt=%.1f bwd=%.1f opt=%.1f step=%.1f",
+                            int(params.batch_idx_train),
+                            attribution,
+                            phase_summary["encoder"]["spread"],
+                            phase_summary["rnnt_path"]["spread"],
+                            phase_summary["backward"]["spread"],
+                            phase_summary["optim"]["spread"],
+                            phase_summary["step"]["spread"],
+                        )
+                elif rank == 0:
+                    phase_summary = {
+                        "encoder": _phase_summary(
+                            [float(phase_stats.get("encoder_ms", 0.0))]
+                        ),
+                        "rnnt_path": _phase_summary(
+                            [float(phase_stats.get("rnnt_path_ms", 0.0))]
+                        ),
+                        "backward": _phase_summary([float(backward_time_ms)]),
+                        "optim": _phase_summary([float(optim_time_ms)]),
+                        "step": _phase_summary([float(batch_time_ms)]),
+                    }
+                    profile_record = {
+                        "record_type": "rank_phase_profile_single_rank",
+                        "step": int(params.batch_idx_train),
+                        "epoch": int(params.cur_epoch),
+                        "world_size": int(world_size),
+                        "phase_summary": phase_summary,
+                        "per_rank": [
+                            {
+                                "rank": int(rank),
+                                "step": int(params.batch_idx_train),
+                                "data_ms": float(data_time_ms),
+                                "compute_ms": float(compute_time_ms),
+                                "step_ms": float(batch_time_ms),
+                                "forward_total_ms": float(
+                                    phase_stats.get("forward_total_ms", 0.0)
+                                ),
+                                "encoder_ms": float(phase_stats.get("encoder_ms", 0.0)),
+                                "rnnt_path_ms": float(
+                                    phase_stats.get("rnnt_path_ms", 0.0)
+                                ),
+                                "ctc_ms": float(phase_stats.get("ctc_ms", 0.0)),
+                                "attn_decoder_ms": float(
+                                    phase_stats.get("attn_decoder_ms", 0.0)
+                                ),
+                                "backward_ms": float(backward_time_ms),
+                                "optim_ms": float(optim_time_ms),
+                                "token_sum": float(phase_stats.get("token_sum", 0.0)),
+                                "token_max": float(phase_stats.get("token_max", 0.0)),
+                                "token_mean": float(phase_stats.get("token_mean", 0.0)),
+                                "lens_sum": float(phase_stats.get("lens_sum", 0.0)),
+                                "nonpad_ratio": float(
+                                    phase_stats.get("nonpad_ratio", 0.0)
+                                ),
+                                "batch_nseq": float(phase_stats.get("batch_nseq", 0.0)),
+                                "batch_T": float(phase_stats.get("batch_T", 0.0)),
+                                "packed_sup_count": float(
+                                    phase_stats.get("packed_sup_count", 0.0)
+                                ),
+                            }
+                        ],
+                    }
+                    _append_jsonl(rank_phase_profile_out, profile_record)
+            except Exception:
+                # Profiling is best-effort and should never break training.
+                pass
+
         if batch_idx % params.log_interval == 0:
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
-            iter_end = time.perf_counter()
-            compute_time = iter_end - compute_start
-            step_time = data_time + compute_time
-            batch_audio_sec = 0.0
-            if batch["supervisions"]["num_frames"] is not None:
-                batch_audio_sec = (
-                    float(batch["supervisions"]["num_frames"].float().sum().item())
-                    / 100.0
-                )
-            batch_time_ms = step_time * 1000.0
-            data_time_ms = data_time * 1000.0
-            compute_time_ms = compute_time * 1000.0
-            speed_utt = (
-                batch_size / max(step_time, 1e-6) if batch_size > 0 else 0.0
-            )
-            speed_audio = (
-                batch_audio_sec / max(step_time, 1e-6)
-                if batch_audio_sec > 0
-                else 0.0
-            )
-            if torch.cuda.is_available():
-                gpu_mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
-                gpu_mem_reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            else:
-                gpu_mem_alloc_mb = 0.0
-                gpu_mem_reserved_mb = 0.0
-
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
@@ -2361,6 +2773,21 @@ def train_one_epoch(
 
     if prof is not None:
         _stop_profiler("epoch_end")
+
+    if rank_phase_profile_enabled and rank == 0 and rank_phase_topk_records:
+        topk_summary = {
+            "record_type": "rank_phase_profile_topk",
+            "epoch": int(params.cur_epoch),
+            "topk": int(rank_phase_profile_topk),
+            "records": rank_phase_topk_records,
+        }
+        _append_jsonl(rank_phase_profile_out, topk_summary)
+        topk_path = Path(str(rank_phase_profile_out) + ".topk.json")
+        topk_path.parent.mkdir(parents=True, exist_ok=True)
+        topk_path.write_text(
+            json.dumps(topk_summary, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value

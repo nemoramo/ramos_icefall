@@ -16,7 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
+import time
+from typing import Dict, Optional, Tuple
 
 import k2
 import torch
@@ -417,6 +418,8 @@ class AsrModel(nn.Module):
         return_encoder_out: bool = False,
         attn_mask: Optional[torch.Tensor] = None,
         packed_supervision_segments: Optional[torch.Tensor] = None,
+        return_timing: bool = False,
+        timing_cuda_sync: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Args:
@@ -455,6 +458,13 @@ class AsrModel(nn.Module):
           return_encoder_out:
             If True, also return (encoder_out, encoder_out_lens) to support
             downstream decoding without re-running the encoder.
+          return_timing:
+            If True, append a dict with per-phase forward timing (milliseconds)
+            to the returned tuple.
+          timing_cuda_sync:
+            If True and CUDA is available, call torch.cuda.synchronize() before
+            each timing capture. Use only for diagnostics since it can reduce
+            throughput.
 
         Returns:
           Return the transducer losses, CTC loss, AED loss,
@@ -486,6 +496,12 @@ class AsrModel(nn.Module):
             assert not use_cr_ctc, "packed_supervision_segments is not supported with CR-CTC"
 
         device = x.device
+        timing: Optional[Dict[str, float]] = {} if return_timing else None
+
+        def _time_now() -> float:
+            if timing is not None and timing_cuda_sync and torch.cuda.is_available():
+                torch.cuda.synchronize(device=device)
+            return time.perf_counter()
 
         # For consistency-regularized CTC, we need two "views" of each utterance.
         # In training we may create the second view via spec-augment/time-warping;
@@ -519,9 +535,13 @@ class AsrModel(nn.Module):
                 y_for_seq = k2.ragged.cat([y, y], axis=0)
 
         # Compute encoder outputs (optionally with external attention mask).
+        t_forward = _time_now()
+        t_encoder = _time_now()
         encoder_out, encoder_out_lens = self.forward_encoder(
             x, x_lens, attn_mask=attn_mask
         )
+        if timing is not None:
+            timing["encoder_ms"] = (_time_now() - t_encoder) * 1000.0
 
         encoder_out_for_loss = encoder_out
         encoder_out_lens_for_loss = encoder_out_lens
@@ -535,6 +555,7 @@ class AsrModel(nn.Module):
 
         if self.use_transducer:
             # Compute transducer loss
+            t_rnnt = _time_now() if timing is not None else 0.0
             simple_loss, pruned_loss = self.forward_transducer(
                 encoder_out=encoder_out_for_loss,
                 encoder_out_lens=encoder_out_lens_for_loss,
@@ -547,12 +568,17 @@ class AsrModel(nn.Module):
             if use_cr_ctc and do_input_dup:
                 simple_loss = simple_loss * 0.5
                 pruned_loss = pruned_loss * 0.5
+            if timing is not None:
+                timing["rnnt_path_ms"] = (_time_now() - t_rnnt) * 1000.0
         else:
             simple_loss = torch.empty(0)
             pruned_loss = torch.empty(0)
+            if timing is not None:
+                timing["rnnt_path_ms"] = 0.0
 
         if self.use_ctc:
             # Compute CTC loss
+            t_ctc = _time_now() if timing is not None else 0.0
             targets = y_for_seq.values
             if not use_cr_ctc:
                 ctc_loss = self.forward_ctc(
@@ -586,11 +612,16 @@ class AsrModel(nn.Module):
                     )
                 ctc_loss = ctc_loss * 0.5
                 cr_loss = cr_loss * 0.5
+            if timing is not None:
+                timing["ctc_ms"] = (_time_now() - t_ctc) * 1000.0
         else:
             ctc_loss = torch.empty(0)
             cr_loss = torch.empty(0)
+            if timing is not None:
+                timing["ctc_ms"] = 0.0
 
         if self.use_attention_decoder:
+            t_attn = _time_now() if timing is not None else 0.0
             attention_decoder_loss = self.attention_decoder.calc_att_loss(
                 encoder_out=encoder_out_for_loss,
                 encoder_out_lens=encoder_out_lens_for_loss,
@@ -599,10 +630,29 @@ class AsrModel(nn.Module):
             )
             if use_cr_ctc and do_input_dup:
                 attention_decoder_loss = attention_decoder_loss * 0.5
+            if timing is not None:
+                timing["attn_decoder_ms"] = (_time_now() - t_attn) * 1000.0
         else:
             attention_decoder_loss = torch.empty(0)
+            if timing is not None:
+                timing["attn_decoder_ms"] = 0.0
+
+        if timing is not None:
+            timing["forward_total_ms"] = (_time_now() - t_forward) * 1000.0
 
         if return_encoder_out:
+            if return_timing:
+                assert timing is not None
+                return (
+                    simple_loss,
+                    pruned_loss,
+                    ctc_loss,
+                    attention_decoder_loss,
+                    cr_loss,
+                    encoder_out,
+                    encoder_out_lens,
+                    timing,
+                )
             return (
                 simple_loss,
                 pruned_loss,
@@ -611,5 +661,15 @@ class AsrModel(nn.Module):
                 cr_loss,
                 encoder_out,
                 encoder_out_lens,
+            )
+        if return_timing:
+            assert timing is not None
+            return (
+                simple_loss,
+                pruned_loss,
+                ctc_loss,
+                attention_decoder_loss,
+                cr_loss,
+                timing,
             )
         return simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss

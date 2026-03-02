@@ -57,6 +57,12 @@ NUM_EPOCHS="${NUM_EPOCHS:-80}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20000}"
 START_EPOCH="${START_EPOCH:-1}"
 START_BATCH="${START_BATCH:-0}"
+# Rank-phase profiling (cross-rank wait attribution).
+RANK_PHASE_PROFILE="${RANK_PHASE_PROFILE:-1}"
+RANK_PHASE_PROFILE_INTERVAL="${RANK_PHASE_PROFILE_INTERVAL:-50}"
+RANK_PHASE_PROFILE_TOPK="${RANK_PHASE_PROFILE_TOPK:-20}"
+RANK_PHASE_PROFILE_CUDA_SYNC="${RANK_PHASE_PROFILE_CUDA_SYNC:-0}"
+RANK_PHASE_PROFILE_OUT="${RANK_PHASE_PROFILE_OUT:-${EXP_DIR}/rank_phase_profile.jsonl}"
 
 # Packing presets:
 # - lhotse_legacy: dataset-side CutConcatenate (each rank packs independently)
@@ -107,6 +113,11 @@ python ./zipformer/train.py \
   --bucketing-shuffle-buffer-size "${BUCKET_SHUFFLE_BUFFER_SIZE}" \
   --valid-interval "${VALID_INTERVAL}" \
   --log-interval "${LOG_INTERVAL}" \
+  --rank-phase-profile "${RANK_PHASE_PROFILE}" \
+  --rank-phase-profile-interval "${RANK_PHASE_PROFILE_INTERVAL}" \
+  --rank-phase-profile-topk "${RANK_PHASE_PROFILE_TOPK}" \
+  --rank-phase-profile-cuda-sync "${RANK_PHASE_PROFILE_CUDA_SYNC}" \
+  --rank-phase-profile-out "${RANK_PHASE_PROFILE_OUT}" \
   --base-lr "${BASE_LR}" \
   --max-train-steps "${MAX_TRAIN_STEPS}" \
   --enable-spec-aug 1 \

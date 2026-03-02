@@ -24,6 +24,7 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from encoder_interface import EncoderInterface
 from scaling import (
     Identity,  # more friendly to backward hooks than nn.Identity(), for diagnostic reasons.
@@ -118,6 +119,7 @@ class Zipformer2(EncoderInterface):
         causal: bool = False,
         chunk_size: Tuple[int] = [-1],
         left_context_frames: Tuple[int] = [-1],
+        use_flash_attention_train: bool = False,
     ) -> None:
         super(Zipformer2, self).__init__()
 
@@ -173,6 +175,7 @@ class Zipformer2(EncoderInterface):
                 dropout=dropout,
                 cnn_module_kernel=cnn_module_kernel[i],
                 causal=causal,
+                use_flash_attention_train=use_flash_attention_train,
             )
 
             # For the segment of the warmup period, we let the Conv2dSubsampling
@@ -615,6 +618,7 @@ class Zipformer2EncoderLayer(nn.Module):
         bypass_skip_rate: FloatLike = ScheduledFloat(
             (0.0, 0.5), (4000.0, 0.02), default=0
         ),
+        use_flash_attention_train: bool = False,
     ) -> None:
         super(Zipformer2EncoderLayer, self).__init__()
         self.embed_dim = embed_dim
@@ -646,7 +650,9 @@ class Zipformer2EncoderLayer(nn.Module):
             query_head_dim=query_head_dim,
             pos_head_dim=pos_head_dim,
             dropout=0.0,
+            use_flash_attention_train=use_flash_attention_train,
         )
+        self._flash_fallback_warned = False
 
         self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim)
 
@@ -762,44 +768,24 @@ class Zipformer2EncoderLayer(nn.Module):
         else:
             return x * dropout_mask
 
-    def forward(
+    def _compute_attention_skip_rate(self) -> float:
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            return 0.0
+        return float(self.attention_skip_rate) if self.training else 0.0
+
+    def _forward_with_attn_weights(
         self,
         src: Tensor,
+        src_orig: Tensor,
         pos_emb: Tensor,
-        chunk_size: int = -1,
-        attn_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
+        chunk_size: int,
+        attn_mask: Optional[Tensor],
+        src_key_padding_mask: Optional[Tensor],
+        attention_skip_rate: float,
     ) -> Tensor:
-        """
-            Pass the input through the encoder layer.
-            Args:
-                src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
-             pos_emb: (1, 2*seq_len-1, pos_emb_dim) or (batch_size, 2*seq_len-1, pos_emb_dim)
-             chunk_size: the number of frames per chunk, of >= 0; if -1, no chunking.
-           feature_mask: something that broadcasts with src, that we'll multiply `src`
-                  by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
-             attn_mask: the attention mask, of shape (batch_size, seq_len, seq_len) or (seq_len, seq_len),
-                    interpreted as (batch_size, tgt_seq_len, src_seq_len) or (tgt_seq_len, src_seq_len).
-                   True means masked position. May be None.
-        src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len); True means
-                 masked position.  May be None.
-
-            Returns:
-               A tensor which has the same shape as src
-        """
-        src_orig = src
-
-        # dropout rate for non-feedforward submodules
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            attention_skip_rate = 0.0
-        else:
-            attention_skip_rate = (
-                float(self.attention_skip_rate) if self.training else 0.0
-            )
-
         # attn_weights: (num_heads, batch_size, seq_len, seq_len)
         attn_weights = self.self_attn_weights(
-            src,
+            src_orig,
             pos_emb=pos_emb,
             attn_mask=attn_mask,
             key_padding_mask=src_key_padding_mask,
@@ -828,13 +814,11 @@ class Zipformer2EncoderLayer(nn.Module):
             )
 
         na = self.balancer_na(self.nonlin_attention(src, selected_attn_weights))
-
         src = src + (
             na if self_attn_dropout_mask is None else na * self_attn_dropout_mask
         )
 
         self_attn = self.self_attn1(src, attn_weights)
-
         src = src + (
             self_attn
             if self_attn_dropout_mask is None
@@ -864,7 +848,6 @@ class Zipformer2EncoderLayer(nn.Module):
         src = self.bypass_mid(src_orig, src)
 
         self_attn = self.self_attn2(src, attn_weights)
-
         src = src + (
             self_attn
             if self_attn_dropout_mask is None
@@ -892,13 +875,190 @@ class Zipformer2EncoderLayer(nn.Module):
 
         src = self.balancer1(src)
         src = self.norm(src)
-
         src = self.bypass(src_orig, src)
-
         src = self.balancer2(src)
         src = self.whiten(src)
-
         return src
+
+    def _forward_with_flash_attention(
+        self,
+        src: Tensor,
+        src_orig: Tensor,
+        pos_emb: Tensor,
+        chunk_size: int,
+        attn_mask: Optional[Tensor],
+        src_key_padding_mask: Optional[Tensor],
+        attention_skip_rate: float,
+    ) -> Tensor:
+        q, k, attn_bias = self.self_attn_weights.get_flash_qk_bias(
+            src_orig,
+            pos_emb=pos_emb,
+            key_padding_mask=src_key_padding_mask,
+            attn_mask=attn_mask,
+        )
+
+        src = src + self.feed_forward1(src)
+        self_attn_dropout_mask = self.get_sequence_dropout_mask(
+            src, attention_skip_rate
+        )
+
+        # Keep existing const-attention behavior for NonlinAttention by
+        # computing legacy attention weights in this rare branch.
+        use_const_attention = False
+        if not (torch.jit.is_scripting() or torch.jit.is_tracing()) and self.training:
+            use_const_attention = random.random() < float(self.const_attention_rate)
+
+        if use_const_attention:
+            attn_weights = self.self_attn_weights(
+                src_orig,
+                pos_emb=pos_emb,
+                attn_mask=attn_mask,
+                key_padding_mask=src_key_padding_mask,
+            )
+            selected_attn_weights = attn_weights[0:1]
+            selected_attn_weights = (selected_attn_weights > 0.0).to(
+                selected_attn_weights.dtype
+            )
+            selected_attn_weights = selected_attn_weights * (
+                1.0 / selected_attn_weights.sum(dim=-1, keepdim=True)
+            )
+            na = self.nonlin_attention(src, selected_attn_weights)
+        else:
+            nonlin_bias = self.self_attn_weights.select_attn_bias_head(attn_bias, 0)
+            na = self.nonlin_attention.forward_with_flash(
+                src=src,
+                q=q[:, 0:1],
+                k=k[:, 0:1],
+                attn_bias=nonlin_bias,
+                attn_impl=self.self_attn_weights,
+            )
+        na = self.balancer_na(na)
+        src = src + (
+            na if self_attn_dropout_mask is None else na * self_attn_dropout_mask
+        )
+
+        self_attn = self.self_attn1.forward_with_flash(
+            src=src, q=q, k=k, attn_bias=attn_bias, attn_impl=self.self_attn_weights
+        )
+        src = src + (
+            self_attn
+            if self_attn_dropout_mask is None
+            else self_attn * self_attn_dropout_mask
+        )
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            conv_skip_rate = 0.0
+        else:
+            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
+        src = src + self.sequence_dropout(
+            self.conv_module1(
+                src, chunk_size=chunk_size, src_key_padding_mask=src_key_padding_mask
+            ),
+            conv_skip_rate,
+        )
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            ff2_skip_rate = 0.0
+        else:
+            ff2_skip_rate = float(self.ff2_skip_rate) if self.training else 0.0
+        src = src + self.sequence_dropout(
+            self.balancer_ff2(self.feed_forward2(src)), ff2_skip_rate
+        )
+
+        src = self.bypass_mid(src_orig, src)
+
+        self_attn = self.self_attn2.forward_with_flash(
+            src=src, q=q, k=k, attn_bias=attn_bias, attn_impl=self.self_attn_weights
+        )
+        src = src + (
+            self_attn
+            if self_attn_dropout_mask is None
+            else self_attn * self_attn_dropout_mask
+        )
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            conv_skip_rate = 0.0
+        else:
+            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
+        src = src + self.sequence_dropout(
+            self.conv_module2(
+                src, chunk_size=chunk_size, src_key_padding_mask=src_key_padding_mask
+            ),
+            conv_skip_rate,
+        )
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            ff3_skip_rate = 0.0
+        else:
+            ff3_skip_rate = float(self.ff3_skip_rate) if self.training else 0.0
+        src = src + self.sequence_dropout(
+            self.balancer_ff3(self.feed_forward3(src)), ff3_skip_rate
+        )
+
+        src = self.balancer1(src)
+        src = self.norm(src)
+        src = self.bypass(src_orig, src)
+        src = self.balancer2(src)
+        src = self.whiten(src)
+        return src
+
+    def forward(
+        self,
+        src: Tensor,
+        pos_emb: Tensor,
+        chunk_size: int = -1,
+        attn_mask: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+            Pass the input through the encoder layer.
+            Args:
+                src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
+             pos_emb: (1, 2*seq_len-1, pos_emb_dim) or (batch_size, 2*seq_len-1, pos_emb_dim)
+             chunk_size: the number of frames per chunk, of >= 0; if -1, no chunking.
+           feature_mask: something that broadcasts with src, that we'll multiply `src`
+                  by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
+             attn_mask: the attention mask, of shape (batch_size, seq_len, seq_len) or (seq_len, seq_len),
+                    interpreted as (batch_size, tgt_seq_len, src_seq_len) or (tgt_seq_len, src_seq_len).
+                   True means masked position. May be None.
+        src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len); True means
+                 masked position.  May be None.
+
+            Returns:
+               A tensor which has the same shape as src
+        """
+        src_orig = src
+        attention_skip_rate = self._compute_attention_skip_rate()
+
+        if self.self_attn_weights.can_use_flash_attention(src):
+            try:
+                return self._forward_with_flash_attention(
+                    src=src,
+                    src_orig=src_orig,
+                    pos_emb=pos_emb,
+                    chunk_size=chunk_size,
+                    attn_mask=attn_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    attention_skip_rate=attention_skip_rate,
+                )
+            except Exception as e:
+                if not self._flash_fallback_warned:
+                    logging.warning(
+                        "Flash attention path failed in Zipformer2EncoderLayer; "
+                        "falling back to legacy attention. Error: %s",
+                        repr(e),
+                    )
+                    self._flash_fallback_warned = True
+
+        return self._forward_with_attn_weights(
+            src=src,
+            src_orig=src_orig,
+            pos_emb=pos_emb,
+            chunk_size=chunk_size,
+            attn_mask=attn_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            attention_skip_rate=attention_skip_rate,
+        )
 
     def streaming_forward(
         self,
@@ -1568,6 +1728,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         pos_head_dim: int,
         dropout: float = 0.0,
         pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5), (4000.0, 0.0)),
+        use_flash_attention_train: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -1576,6 +1737,10 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         self.pos_head_dim = pos_head_dim
         self.dropout = dropout
         self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
+        # Experimental feature: enabled only in training, with explicit fallback
+        # to legacy attention when runtime conditions are not met.
+        self.use_flash_attention_train = use_flash_attention_train
+        self._flash_condition_warned = False
         self.name = None  # will be overwritten in training code; for diagnostics.
 
         key_head_dim = query_head_dim
@@ -1623,6 +1788,204 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         # the following are for diagnostics only, see --print-diagnostics option
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
+
+    def can_use_flash_attention(self, x: Tensor) -> bool:
+        if not self.use_flash_attention_train:
+            return False
+        if not self.training:
+            return False
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            return False
+        if x.device.type != "cuda":
+            if not self._flash_condition_warned:
+                logging.warning(
+                    "use_flash_attention_train=True but input is on %s; "
+                    "falling back to legacy attention.",
+                    x.device.type,
+                )
+                self._flash_condition_warned = True
+            return False
+        if not hasattr(F, "scaled_dot_product_attention"):
+            if not self._flash_condition_warned:
+                logging.warning(
+                    "scaled_dot_product_attention is unavailable; "
+                    "falling back to legacy attention."
+                )
+                self._flash_condition_warned = True
+            return False
+        return True
+
+    @staticmethod
+    def select_attn_bias_head(
+        attn_bias: Optional[Tensor], head_index: int
+    ) -> Optional[Tensor]:
+        if attn_bias is None:
+            return None
+        if attn_bias.shape[1] == 1:
+            return attn_bias
+        return attn_bias[:, head_index : head_index + 1]
+
+    def _project_qkp(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        x = self.in_proj(x)
+        query_head_dim = self.query_head_dim
+        pos_head_dim = self.pos_head_dim
+        num_heads = self.num_heads
+
+        seq_len, batch_size, _ = x.shape
+        query_dim = query_head_dim * num_heads
+
+        q = x[..., 0:query_dim]
+        k = x[..., query_dim : 2 * query_dim]
+        p = x[..., 2 * query_dim :]
+        assert p.shape[-1] == num_heads * pos_head_dim, (
+            p.shape[-1],
+            num_heads,
+            pos_head_dim,
+        )
+
+        q = self.copy_query(q)
+        k = self.whiten_keys(self.balance_keys(k))
+        p = self.copy_pos_query(p)
+
+        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim).permute(1, 2, 0, 3)
+        k = k.reshape(seq_len, batch_size, num_heads, query_head_dim).permute(1, 2, 0, 3)
+        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim).permute(1, 2, 0, 3)
+        return q, k, p
+
+    def _get_pos_scores(self, p: Tensor, pos_emb: Tensor) -> Optional[Tensor]:
+        # p: (batch, head, time1, pos_head_dim)
+        use_pos_scores = False
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            use_pos_scores = True
+        elif not self.training or random.random() >= float(self.pos_emb_skip_rate):
+            use_pos_scores = True
+        if not use_pos_scores:
+            return None
+
+        seq_len = p.shape[2]
+        num_heads = self.num_heads
+        pos_head_dim = self.pos_head_dim
+
+        pos_emb = self.linear_pos(pos_emb)
+        seq_len2 = 2 * seq_len - 1
+        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(
+            2, 0, 3, 1
+        )
+        # pos_emb: (head, {1 or batch}, pos_head_dim, seq_len2)
+        p_h = p.permute(1, 0, 2, 3)
+        pos_scores = torch.matmul(p_h, pos_emb)
+        pos_scores = pos_scores.as_strided(
+            (num_heads, p.shape[0], seq_len, seq_len),
+            (
+                pos_scores.stride(0),
+                pos_scores.stride(1),
+                pos_scores.stride(2) - pos_scores.stride(3),
+                pos_scores.stride(3),
+            ),
+            storage_offset=pos_scores.stride(3) * (seq_len - 1),
+        )
+        return pos_scores.permute(1, 0, 2, 3).contiguous()
+
+    def _get_mask_bias(
+        self,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        key_padding_mask: Optional[Tensor],
+        attn_mask: Optional[Tensor],
+    ) -> Optional[Tensor]:
+        if attn_mask is None and key_padding_mask is None:
+            return None
+
+        mask_bias = torch.zeros(
+            batch_size,
+            1,
+            seq_len,
+            seq_len,
+            dtype=dtype,
+            device=device,
+        )
+        neg_large = -1000.0
+
+        if attn_mask is not None:
+            assert attn_mask.dtype == torch.bool
+            if attn_mask.ndim == 2:
+                mask_bias = mask_bias.masked_fill(attn_mask.unsqueeze(0).unsqueeze(0), neg_large)
+            else:
+                assert attn_mask.ndim == 3, attn_mask.shape
+                mask_bias = mask_bias.masked_fill(attn_mask.unsqueeze(1), neg_large)
+
+        if key_padding_mask is not None:
+            assert key_padding_mask.shape == (batch_size, seq_len), key_padding_mask.shape
+            mask_bias = mask_bias.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), neg_large
+            )
+        return mask_bias
+
+    def get_flash_qk_bias(
+        self,
+        x: Tensor,
+        pos_emb: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        # q/k: (batch, head, time, d_head); attn_bias: (batch, head|1, time, time)
+        q, k, p = self._project_qkp(x)
+        batch_size, _, seq_len, _ = q.shape
+
+        pos_scores = self._get_pos_scores(p, pos_emb=pos_emb)
+        mask_bias = self._get_mask_bias(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            dtype=q.dtype,
+            device=q.device,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+        )
+
+        attn_bias = pos_scores
+        if attn_bias is None:
+            attn_bias = mask_bias
+        elif mask_bias is not None:
+            attn_bias = attn_bias + mask_bias
+        return q, k, attn_bias
+
+    def flash_attention_from_qkv(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_bias: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Keep scale=1.0 to match the legacy attention score convention.
+        out_dtype = v.dtype
+        use_internal_fp16 = (
+            q.device.type == "cuda"
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and v.dtype == torch.float32
+        )
+
+        if use_internal_fp16:
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+            if attn_bias is not None:
+                attn_bias = attn_bias.to(torch.float16)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+            scale=1.0,
+        )
+        if out.dtype != out_dtype:
+            out = out.to(out_dtype)
+        return out
 
     def forward(
         self,
@@ -1983,6 +2346,37 @@ class SelfAttention(nn.Module):
 
         return x
 
+    def forward_with_flash(
+        self,
+        src: Tensor,
+        q: Tensor,
+        k: Tensor,
+        attn_bias: Optional[Tensor],
+        attn_impl: "RelPositionMultiheadAttentionWeights",
+    ) -> Tensor:
+        """
+        Args:
+          src: input tensor, of shape (seq_len, batch_size, embed_dim)
+          q: query tensor, of shape (batch_size, num_heads, seq_len, query_head_dim)
+          k: key tensor, of shape (batch_size, num_heads, seq_len, query_head_dim)
+          attn_bias: additive attention bias.
+          attn_impl: attention helper implementation.
+        """
+        (seq_len, batch_size, _embed_dim) = src.shape
+        num_heads = q.shape[1]
+
+        v = self.in_proj(src)  # (seq_len, batch_size, num_heads * value_head_dim)
+        v = v.reshape(seq_len, batch_size, num_heads, -1).permute(1, 2, 0, 3).contiguous()
+        x = attn_impl.flash_attention_from_qkv(q=q, k=k, v=v, attn_bias=attn_bias)
+        x = (
+            x.permute(2, 0, 1, 3)
+            .contiguous()
+            .view(seq_len, batch_size, -1)
+        )
+        x = self.out_proj(x)
+        x = self.whiten(x)
+        return x
+
     def streaming_forward(
         self,
         x: Tensor,
@@ -2182,6 +2576,48 @@ class NonlinAttention(nn.Module):
         x = x * y
         x = self.identity3(x)
 
+        x = self.out_proj(x)
+        x = self.whiten2(x)
+        return x
+
+    def forward_with_flash(
+        self,
+        src: Tensor,
+        q: Tensor,
+        k: Tensor,
+        attn_bias: Optional[Tensor],
+        attn_impl: "RelPositionMultiheadAttentionWeights",
+    ) -> Tensor:
+        """
+        Args:
+          src: a Tensor of shape (seq_len, batch_size, num_channels)
+          q: query tensor, shape (batch_size, num_heads, seq_len, query_head_dim)
+          k: key tensor, shape (batch_size, num_heads, seq_len, query_head_dim)
+          attn_bias: additive attention bias.
+          attn_impl: attention helper implementation.
+        """
+        x = self.in_proj(src)
+
+        (seq_len, batch_size, _) = x.shape
+        hidden_channels = self.hidden_channels
+
+        s, x, y = x.chunk(3, dim=2)
+        s = self.balancer(s)
+        s = self.tanh(s)
+
+        s = s.unsqueeze(-1).reshape(seq_len, batch_size, hidden_channels)
+        x = self.whiten1(x)
+        x = x * s
+        x = self.identity1(x)
+
+        num_heads = q.shape[1]
+        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(1, 2, 0, 3).contiguous()
+        x = attn_impl.flash_attention_from_qkv(q=q, k=k, v=x, attn_bias=attn_bias)
+        x = x.permute(2, 0, 1, 3).reshape(seq_len, batch_size, -1)
+
+        y = self.identity2(y)
+        x = x * y
+        x = self.identity3(x)
         x = self.out_proj(x)
         x = self.whiten2(x)
         return x
