@@ -351,6 +351,16 @@ class Zipformer2(EncoderInterface):
                 chunk_attn_mask = chunk_attn_mask.unsqueeze(0)
             elif attn_mask.ndim == 2 and chunk_attn_mask.ndim == 3:
                 attn_mask = attn_mask.unsqueeze(0)
+            # In packed training, minor off-by-one can happen after subsampling.
+            # Align both masks to the same (query_len, key_len) before OR.
+            if (
+                attn_mask.shape[-2] != chunk_attn_mask.shape[-2]
+                or attn_mask.shape[-1] != chunk_attn_mask.shape[-1]
+            ):
+                query_len = min(attn_mask.shape[-2], chunk_attn_mask.shape[-2])
+                key_len = min(attn_mask.shape[-1], chunk_attn_mask.shape[-1])
+                attn_mask = attn_mask[..., :query_len, :key_len]
+                chunk_attn_mask = chunk_attn_mask[..., :query_len, :key_len]
             combined_attn_mask = torch.logical_or(attn_mask, chunk_attn_mask)
 
         for i, module in enumerate(self.encoders):
