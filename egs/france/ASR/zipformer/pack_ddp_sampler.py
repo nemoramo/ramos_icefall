@@ -564,7 +564,7 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
         self._raw_pool = cuts
         return packed_out
 
-    def _next_raw_best_fit(self) -> CutSet:
+    def _next_raw_best_fit_splits(self) -> List[CutSet]:
         target_total = self._target_total_packed_cuts()
         pool_target = self._raw_pool_target_size()
 
@@ -604,9 +604,13 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
             world_size=int(self.world_size),
             quadratic_duration=self.quadratic_duration,
         )
+        return splits
+
+    def _next_raw_best_fit(self) -> CutSet:
+        splits = self._next_raw_best_fit_splits()
         return splits[int(self.rank)]
 
-    def __next__(self) -> CutSet:
+    def _next_rank_splits_raw(self) -> List[CutSet]:
         if self._inner_iter is None:
             self._inner_iter = iter(self.inner)
 
@@ -618,33 +622,44 @@ class PackAwareDistributedDynamicBucketingSampler(CutSampler):
                 world_size=int(self.world_size),
                 quadratic_duration=self.quadratic_duration,
             )
-            selected = splits[int(self.rank)]
-        elif self.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack"):
-            selected = self._next_raw_best_fit()
-        else:
-            # Build a deterministic mega-batch by taking world_size successive inner batches.
-            raw_batches: List[CutSet] = []
-            for _ in range(int(self.world_size)):
-                raw_batches.append(next(self._inner_iter))  # may raise StopIteration
+            return splits
 
-            mega_cuts: List[Any] = []
-            for cs in raw_batches:
-                mega_cuts.extend(list(cs))
-            raw_mega = CutSet.from_cuts(mega_cuts)
+        if self.pack_fill_strategy in ("raw_best_fit", "raw_best_fit_knapsack"):
+            return self._next_raw_best_fit_splits()
 
-            packed = self.packer(raw_mega)
+        # Build a deterministic mega-batch by taking world_size successive inner batches.
+        raw_batches: List[CutSet] = []
+        for _ in range(int(self.world_size)):
+            raw_batches.append(next(self._inner_iter))  # may raise StopIteration
 
-            # If packing yields too few packed cuts (< world_size), splitting would
-            # produce empty batches for some ranks. Fall back to per-rank packing.
-            if len(packed) < int(self.world_size):
-                selected = self.packer(raw_batches[int(self.rank)])
-            else:
-                splits = _split_packed_cuts_by_count_and_sum_dur(
-                    packed,
-                    world_size=int(self.world_size),
-                    quadratic_duration=self.quadratic_duration,
-                )
-                selected = splits[int(self.rank)]
+        mega_cuts: List[Any] = []
+        for cs in raw_batches:
+            mega_cuts.extend(list(cs))
+        raw_mega = CutSet.from_cuts(mega_cuts)
+
+        packed = self.packer(raw_mega)
+
+        # If packing yields too few packed cuts (< world_size), splitting would
+        # produce empty batches for some ranks. Fall back to per-rank packing.
+        if len(packed) < int(self.world_size):
+            out: List[CutSet] = []
+            for r in range(int(self.world_size)):
+                out.append(self.packer(raw_batches[r]))
+            return out
+
+        return _split_packed_cuts_by_count_and_sum_dur(
+            packed,
+            world_size=int(self.world_size),
+            quadratic_duration=self.quadratic_duration,
+        )
+
+    def next_rank_splits(self) -> List[CutSet]:
+        """Return one raw packed CutSet per rank for the next global sampling step."""
+        return self._next_rank_splits_raw()
+
+    def __next__(self) -> CutSet:
+        splits = self._next_rank_splits_raw()
+        selected = splits[int(self.rank)]
 
         self._log_diagnostics(selected)
         for tfn in self._transforms:

@@ -77,6 +77,8 @@ from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import AsrModel
+from node_batch_ipc import NodeBatchIPC, create_node_batch_ipc
+from node_batch_producer import NodeBatchProducer
 from optim import Eden, ScaledAdam
 from scaling import ScheduledFloat
 from subsampling import Conv2dSubsampling
@@ -2370,7 +2372,12 @@ def train_one_epoch(
     return params.max_train_steps > 0 and params.batch_idx_train >= params.max_train_steps
 
 
-def run(rank, world_size, args):
+def run(
+    rank: int,
+    world_size: int,
+    args: argparse.Namespace,
+    node_data_ipc: Optional[NodeBatchIPC] = None,
+):
     """
     Args:
       rank:
@@ -2381,12 +2388,22 @@ def run(rank, world_size, args):
         Number of GPUs for DDP training.
       args:
         The return value of get_parser().parse_args()
+      node_data_ipc:
+        Shared IPC object for node-level producer/consumer mode.
     """
     params = get_params()
     params.update(vars(args))
     # Expose distributed rank/world_size to data module for sampler sharding.
     args.rank = rank
     args.world_size = world_size
+    node_data_enabled = (
+        bool(getattr(args, "node_data_producer", False)) and int(world_size) > 1
+    )
+    if node_data_enabled and node_data_ipc is None:
+        raise ValueError(
+            "--node-data-producer is enabled but node_data_ipc is missing."
+        )
+    node_producer: Optional[NodeBatchProducer] = None
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -2588,9 +2605,42 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = msr.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
+    if node_data_enabled:
+        metrics_out = str(getattr(params, "node_data_producer_metrics_out", "")).strip()
+        if metrics_out == "":
+            metrics_out = str(Path(params.exp_dir) / "node_producer_metrics.jsonl")
+
+        if rank == 0:
+            producer_sampler = msr.build_node_producer_sampler(
+                train_cuts, sampler_state_dict=sampler_state_dict
+            )
+            node_producer = NodeBatchProducer(
+                sampler=producer_sampler,
+                ipc=node_data_ipc,
+                metrics_out=Path(metrics_out),
+                log_interval_sec=float(
+                    getattr(params, "node_data_producer_log_interval", 20)
+                ),
+                heartbeat_sec=float(
+                    getattr(params, "node_data_producer_heartbeat_sec", 2)
+                ),
+            )
+            node_producer.start()
+            logging.info(
+                "Node data producer started: metrics_out=%s queue_size=%s",
+                metrics_out,
+                int(getattr(params, "node_data_producer_queue_size", 32)),
+            )
+
+        train_dl = msr.train_dataloaders(
+            train_cuts,
+            sampler_state_dict=None,
+            node_data_ipc=node_data_ipc,
+        )
+    else:
+        train_dl = msr.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
 
     valid_cuts = msr.dev_cuts()
     max_valid_dur = float(getattr(params, "max_valid_cut_duration", 0.0))
@@ -2629,50 +2679,60 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
-        scheduler.step_epoch(epoch - 1)
-        fix_random_seed(params.seed + epoch - 1)
-        train_dl.sampler.set_epoch(epoch - 1)
+    try:
+        for epoch in range(params.start_epoch, params.num_epochs + 1):
+            scheduler.step_epoch(epoch - 1)
+            fix_random_seed(params.seed + epoch - 1)
+            train_dl.sampler.set_epoch(epoch - 1)
 
-        if tb_writer is not None:
-            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+            if node_data_enabled and rank == 0 and node_producer is not None:
+                node_producer.request_epoch(epoch - 1)
+            if node_data_enabled and world_size > 1:
+                torch.distributed.barrier()
 
-        params.cur_epoch = epoch
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
 
-        reached_max_steps = train_one_epoch(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sp=sp,
-            train_dl=train_dl,
-            valid_dl=valid_dl,
-            scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
-            rank=rank,
-        )
+            params.cur_epoch = epoch
 
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-
-        save_checkpoint(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler,
-            scaler=scaler,
-            rank=rank,
-        )
-        if reached_max_steps:
-            logging.info(
-                f"Stopped at global batch_idx_train={params.batch_idx_train} due to max_train_steps."
+            reached_max_steps = train_one_epoch(
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sp=sp,
+                train_dl=train_dl,
+                valid_dl=valid_dl,
+                scaler=scaler,
+                tb_writer=tb_writer,
+                world_size=world_size,
+                rank=rank,
             )
-            break
+
+            if params.print_diagnostics:
+                diagnostic.print_diagnostics()
+                break
+
+            save_checkpoint(
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=train_dl.sampler,
+                scaler=scaler,
+                rank=rank,
+            )
+            if reached_max_steps:
+                logging.info(
+                    f"Stopped at global batch_idx_train={params.batch_idx_train} due to max_train_steps."
+                )
+                break
+    finally:
+        if node_data_enabled and rank == 0 and node_producer is not None:
+            logging.info("Stopping node data producer.")
+            node_producer.stop(set_stop_event=False)
 
     logging.info("Done!")
 
@@ -2763,6 +2823,20 @@ def main():
 
     world_size = args.world_size
     assert world_size >= 1
+    node_data_ipc: Optional[NodeBatchIPC] = None
+    node_data_manager = None
+    if bool(getattr(args, "node_data_producer", False)):
+        if world_size <= 1:
+            print(
+                "--node-data-producer requires --world-size > 1; disabling it for single-GPU run."
+            )
+            args.node_data_producer = False
+        else:
+            node_data_ipc, node_data_manager = create_node_batch_ipc(
+                world_size=int(world_size),
+                queue_size=int(getattr(args, "node_data_producer_queue_size", 32)),
+            )
+
     if world_size > 1:
         # Avoid failing DDP init with "EADDRINUSE" when the chosen master port is
         # already occupied by another job on the same host.
@@ -2793,9 +2867,14 @@ def main():
 
             os.environ["MASTER_PORT"] = str(args.master_port)
 
-        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+        mp.spawn(
+            run,
+            args=(world_size, args, node_data_ipc),
+            nprocs=world_size,
+            join=True,
+        )
     else:
-        run(rank=0, world_size=1, args=args)
+        run(rank=0, world_size=1, args=args, node_data_ipc=None)
 
 
 torch.set_num_threads(1)

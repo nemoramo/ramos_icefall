@@ -44,6 +44,7 @@ from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
 
+from consumer_sampler import ConsumerCutSampler
 from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
 
 
@@ -557,11 +558,136 @@ class MSR_AsrDataModule:
             default=8,
             help="Prefetch factor for test dataloader when --num-workers > 0.",
         )
+        group.add_argument(
+            "--node-data-producer",
+            type=str2bool,
+            default=False,
+            help=(
+                "If True (DDP only), use a node-level producer to generate packed "
+                "batches and let each rank consume from per-rank queues."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-queue-size",
+            type=int,
+            default=32,
+            help="Per-rank queue size (in batches) for node-data-producer mode.",
+        )
+        group.add_argument(
+            "--node-data-producer-max-ahead-steps",
+            type=int,
+            default=16,
+            help=(
+                "Reserved knob for node producer depth control. "
+                "Current implementation is bounded by queue size."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-log-interval",
+            type=int,
+            default=20,
+            help="Seconds between producer progress/throughput log records.",
+        )
+        group.add_argument(
+            "--node-data-producer-metrics-out",
+            type=str,
+            default="",
+            help=(
+                "JSONL path for producer metrics. "
+                "If empty, defaults to <exp_dir>/node_producer_metrics.jsonl."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-block-on-empty",
+            type=str2bool,
+            default=True,
+            help=(
+                "If True, consumer sampler blocks when queue is empty "
+                "(recommended for stability)."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-block-timeout-sec",
+            type=int,
+            default=0,
+            help=(
+                "Consumer wait timeout (seconds) when queue is empty. "
+                "Set <= 0 for infinite wait."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-heartbeat-sec",
+            type=int,
+            default=2,
+            help="Heartbeat cadence (seconds) for producer-side metrics updates.",
+        )
+
+    def _build_pack_sampler(
+        self,
+        cuts_train: CutSet,
+        *,
+        world_size: int,
+        rank: int,
+    ) -> PackAwareDistributedDynamicBucketingSampler:
+        q = float(getattr(self.args, "quadratic_duration", 0.0))
+        pack_max_dur = float(getattr(self.args, "concatenate_cuts_max_duration", 0.0))
+        return PackAwareDistributedDynamicBucketingSampler(
+            cuts_train,
+            max_duration=float(self.args.max_duration),
+            max_cuts=int(self.args.max_cuts) if int(self.args.max_cuts) > 0 else None,
+            shuffle=bool(self.args.shuffle),
+            drop_last=bool(self.args.drop_last),
+            num_buckets=int(self.args.num_buckets),
+            buffer_size=int(self.args.bucketing_buffer_size),
+            shuffle_buffer_size=int(self.args.bucketing_shuffle_buffer_size),
+            quadratic_duration=q if q > 0 else None,
+            world_size=int(world_size),
+            rank=int(rank),
+            seed=int(getattr(self.args, "seed", 0)),
+            gap=float(self.args.gap),
+            duration_factor=float(self.args.duration_factor),
+            pack_max_duration=pack_max_dur if pack_max_dur > 0 else None,
+            pack_fill_strategy=str(getattr(self.args, "pack_fill_strategy", "legacy")),
+            pack_raw_pool_size=int(getattr(self.args, "pack_raw_pool_size", 0)),
+            pack_max_pieces_per_bin=int(getattr(self.args, "pack_max_pieces_per_bin", 0)),
+            pack_min_remaining_duration=float(
+                getattr(self.args, "pack_min_remaining_duration", 0.5)
+            ),
+            pack_tail_knapsack_rem=float(
+                getattr(self.args, "pack_tail_knapsack_rem", 5.0)
+            ),
+            pack_tail_knapsack_max_candidates=int(
+                getattr(self.args, "pack_tail_knapsack_max_candidates", 128)
+            ),
+            pack_tail_knapsack_max_pieces=int(
+                getattr(self.args, "pack_tail_knapsack_max_pieces", 4)
+            ),
+        )
+
+    def build_node_producer_sampler(
+        self,
+        cuts_train: CutSet,
+        sampler_state_dict: Optional[Dict[str, Any]] = None,
+    ) -> PackAwareDistributedDynamicBucketingSampler:
+        world_size = int(getattr(self.args, "world_size", 1))
+        if world_size <= 1:
+            raise ValueError("node producer requires world_size > 1")
+        if not bool(getattr(self.args, "bucketing_sampler", True)):
+            raise ValueError("node producer requires --bucketing-sampler=true")
+        if not bool(getattr(self.args, "ddp_pack_sampler", False)):
+            raise ValueError("node producer requires --ddp-pack-sampler=true")
+        if not bool(getattr(self.args, "concatenate_cuts", False)):
+            raise ValueError("node producer requires --concatenate-cuts=true")
+        sampler = self._build_pack_sampler(cuts_train, world_size=world_size, rank=0)
+        if sampler_state_dict is not None:
+            sampler.load_state_dict(sampler_state_dict)
+        return sampler
 
     def train_dataloaders(
         self,
         cuts_train: CutSet,
         sampler_state_dict: Optional[Dict[str, Any]] = None,
+        node_data_ipc: Optional[Any] = None,
     ) -> DataLoader:
         """
         Args:
@@ -573,11 +699,21 @@ class MSR_AsrDataModule:
         transforms = []
         world_size = int(getattr(self.args, "world_size", 1))
         rank = int(getattr(self.args, "rank", 0))
+        node_data_enabled = (
+            bool(getattr(self.args, "node_data_producer", False))
+            and world_size > 1
+            and node_data_ipc is not None
+        )
         use_ddp_pack_sampler = (
             bool(getattr(self.args, "ddp_pack_sampler", False))
             and world_size > 1
             and bool(getattr(self.args, "concatenate_cuts", False))
         )
+        if node_data_enabled and not use_ddp_pack_sampler:
+            raise ValueError(
+                "--node-data-producer currently requires DDP pack sampler "
+                "(--ddp-pack-sampler=true and --concatenate-cuts=true in DDP)."
+            )
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
             logging.info("About to get Musan cuts")
@@ -683,47 +819,28 @@ class MSR_AsrDataModule:
             if q > 0:
                 sampler_kwargs["quadratic_duration"] = q
 
-            if use_ddp_pack_sampler:
-                pack_max_dur = float(
-                    getattr(self.args, "concatenate_cuts_max_duration", 0.0)
-                )
-                train_sampler = PackAwareDistributedDynamicBucketingSampler(
-                    cuts_train,
-                    max_duration=float(self.args.max_duration),
-                    max_cuts=int(self.args.max_cuts) if int(self.args.max_cuts) > 0 else None,
+            if node_data_enabled:
+                if sampler_state_dict is not None:
+                    logging.info(
+                        "Node producer mode: sampler state is loaded by producer sampler."
+                    )
+                train_sampler = ConsumerCutSampler(
+                    ipc=node_data_ipc,
+                    rank=rank,
+                    world_size=world_size,
                     shuffle=bool(self.args.shuffle),
                     drop_last=bool(self.args.drop_last),
-                    num_buckets=int(self.args.num_buckets),
-                    buffer_size=int(self.args.bucketing_buffer_size),
-                    shuffle_buffer_size=int(self.args.bucketing_shuffle_buffer_size),
-                    quadratic_duration=q if q > 0 else None,
-                    world_size=world_size,
-                    rank=rank,
                     seed=int(getattr(self.args, "seed", 0)),
-                    gap=float(self.args.gap),
-                    duration_factor=float(self.args.duration_factor),
-                    pack_max_duration=pack_max_dur if pack_max_dur > 0 else None,
-                    pack_fill_strategy=str(
-                        getattr(self.args, "pack_fill_strategy", "legacy")
+                    block_on_empty=bool(
+                        getattr(self.args, "node_data_producer_block_on_empty", True)
                     ),
-                    pack_raw_pool_size=int(
-                        getattr(self.args, "pack_raw_pool_size", 0)
+                    block_timeout_sec=float(
+                        getattr(self.args, "node_data_producer_block_timeout_sec", 0)
                     ),
-                    pack_max_pieces_per_bin=int(
-                        getattr(self.args, "pack_max_pieces_per_bin", 0)
-                    ),
-                    pack_min_remaining_duration=float(
-                        getattr(self.args, "pack_min_remaining_duration", 0.5)
-                    ),
-                    pack_tail_knapsack_rem=float(
-                        getattr(self.args, "pack_tail_knapsack_rem", 5.0)
-                    ),
-                    pack_tail_knapsack_max_candidates=int(
-                        getattr(self.args, "pack_tail_knapsack_max_candidates", 128)
-                    ),
-                    pack_tail_knapsack_max_pieces=int(
-                        getattr(self.args, "pack_tail_knapsack_max_pieces", 4)
-                    ),
+                )
+            elif use_ddp_pack_sampler:
+                train_sampler = self._build_pack_sampler(
+                    cuts_train, world_size=world_size, rank=rank
                 )
             elif getattr(self.args, "world_size", 1) > 1:
                 sampler_kwargs.update(
@@ -754,7 +871,7 @@ class MSR_AsrDataModule:
             )
         logging.info("About to create train dataloader")
 
-        if sampler_state_dict is not None:
+        if sampler_state_dict is not None and not node_data_enabled:
             logging.info("Loading sampler state dict")
             train_sampler.load_state_dict(sampler_state_dict)
 
