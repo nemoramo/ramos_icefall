@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
@@ -9,7 +10,7 @@ import queue as py_queue
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from node_batch_ipc import NodeBatchIPC, queue_depths, set_producer_error
 from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
@@ -26,12 +27,19 @@ class NodeBatchProducer:
         metrics_out: Path,
         log_interval_sec: float = 20.0,
         heartbeat_sec: float = 2.0,
+        put_nj: int = 1,
     ) -> None:
         self.sampler = sampler
         self.ipc = ipc
         self.metrics_out = Path(metrics_out)
         self.log_interval_sec = max(1.0, float(log_interval_sec))
         self.heartbeat_sec = max(0.5, float(heartbeat_sec))
+        self.put_nj = max(1, int(put_nj))
+        self._put_pool: Optional[ThreadPoolExecutor] = None
+        if self.put_nj > 1:
+            self._put_pool = ThreadPoolExecutor(
+                max_workers=self.put_nj, thread_name_prefix="node-put"
+            )
 
         self._cmd_q: "py_queue.Queue[Optional[int]]" = py_queue.Queue()
         self._thread: Optional[threading.Thread] = None
@@ -66,6 +74,9 @@ class NodeBatchProducer:
         self._cmd_q.put(None)
         if self._thread is not None:
             self._thread.join(timeout=10.0)
+        if self._put_pool is not None:
+            self._put_pool.shutdown(wait=True)
+            self._put_pool = None
         self.ipc.metrics["producer_alive"] = 0
         self._started = False
 
@@ -108,6 +119,7 @@ class NodeBatchProducer:
             "consumed_step_per_rank": consumed,
             "consumer_wait_ms_per_rank": waits,
             "lag_steps": int(lag_steps),
+            "producer_put_nj": int(self.put_nj),
         }
 
     def _put_blocking(self, rank: int, item: Dict[str, Any]) -> bool:
@@ -123,6 +135,27 @@ class NodeBatchProducer:
                 return True
             except py_queue.Full:
                 continue
+
+    def _put_step_to_all_ranks(self, item_base: Dict[str, Any], splits: List[Any]) -> bool:
+        if self._put_pool is None:
+            for r, cuts in enumerate(splits):
+                item = dict(item_base)
+                item["cuts"] = cuts
+                ok = self._put_blocking(r, item)
+                if not ok:
+                    return False
+            return True
+
+        futures = []
+        for r, cuts in enumerate(splits):
+            item = dict(item_base)
+            item["cuts"] = cuts
+            futures.append(self._put_pool.submit(self._put_blocking, r, item))
+
+        for fut in futures:
+            if not fut.result():
+                return False
+        return True
 
     def _run_epoch(self, epoch: int) -> None:
         self.sampler.set_epoch(int(epoch))
@@ -146,12 +179,9 @@ class NodeBatchProducer:
                 "epoch": int(epoch),
                 "step_id": int(self._step_id),
             }
-            for r, cuts in enumerate(splits):
-                item = dict(item_base)
-                item["cuts"] = cuts
-                ok = self._put_blocking(r, item)
-                if not ok:
-                    return
+            ok = self._put_step_to_all_ranks(item_base, splits)
+            if not ok:
+                return
 
             self.ipc.metrics["produced_steps_total"] = int(
                 self.ipc.metrics.get("produced_steps_total", 0)

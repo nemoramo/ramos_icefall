@@ -2624,12 +2624,14 @@ def run(
                 heartbeat_sec=float(
                     getattr(params, "node_data_producer_heartbeat_sec", 2)
                 ),
+                put_nj=int(getattr(params, "node_data_producer_nj", 8)),
             )
             node_producer.start()
             logging.info(
-                "Node data producer started: metrics_out=%s queue_size=%s",
+                "Node data producer started: metrics_out=%s queue_size=%s put_nj=%s",
                 metrics_out,
                 int(getattr(params, "node_data_producer_queue_size", 32)),
+                int(getattr(params, "node_data_producer_nj", 8)),
             )
 
         train_dl = msr.train_dataloaders(

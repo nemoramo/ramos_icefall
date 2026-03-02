@@ -574,6 +574,15 @@ class MSR_AsrDataModule:
             help="Per-rank queue size (in batches) for node-data-producer mode.",
         )
         group.add_argument(
+            "--node-data-producer-nj",
+            type=int,
+            default=8,
+            help=(
+                "Parallel fan-out workers used by node producer when pushing "
+                "one packed step to per-rank queues. 1 means serial push."
+            ),
+        )
+        group.add_argument(
             "--node-data-producer-max-ahead-steps",
             type=int,
             default=16,
