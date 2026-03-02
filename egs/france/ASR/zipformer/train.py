@@ -59,6 +59,7 @@ import logging
 import os
 import time
 import warnings
+from collections import deque
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -198,6 +199,67 @@ def _compute_feature_lens_list(
         if end > lens[b]:
             lens[b] = end
     return lens
+
+
+def _move_batch_inputs_to_device(
+    batch: Dict[str, Any], device: torch.device
+) -> Dict[str, Any]:
+    if not isinstance(batch, dict):
+        return batch
+    feature = batch.get("inputs", None)
+    if not torch.is_tensor(feature):
+        return batch
+    if feature.device == device:
+        return batch
+    out = dict(batch)
+    out["inputs"] = feature.to(device, non_blocking=True)
+    return out
+
+
+def _iter_with_feature_prefetch(
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    num_prefetch_batches: int,
+):
+    if (
+        num_prefetch_batches <= 0
+        or (not torch.cuda.is_available())
+        or device.type != "cuda"
+    ):
+        for batch in loader:
+            yield batch
+        return
+
+    prefetch_batches = max(1, int(num_prefetch_batches))
+    stream = torch.cuda.Stream(device=device)
+    batch_iter = iter(loader)
+    queue = deque()
+    exhausted = False
+
+    def _enqueue_one() -> None:
+        nonlocal exhausted
+        if exhausted:
+            return
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            exhausted = True
+            return
+        with torch.cuda.stream(stream):
+            batch = _move_batch_inputs_to_device(batch, device=device)
+        queue.append(batch)
+
+    for _ in range(prefetch_batches):
+        _enqueue_one()
+        if exhausted:
+            break
+
+    cur_stream = torch.cuda.current_stream(device=device)
+    while queue:
+        cur_stream.wait_stream(stream)
+        batch = queue.popleft()
+        _enqueue_one()
+        yield batch
 
 
 def get_adjusted_batch_count(params: AttributeDict) -> float:
@@ -585,6 +647,15 @@ def get_parser():
         default=16,
         help="The number of training dataloader workers that "
         "collect the batches.",
+    )
+    parser.add_argument(
+        "--feature-prefetch-batches",
+        type=int,
+        default=2,
+        help=(
+            "Number of training batches to prefetch feature tensors to GPU "
+            "ahead of compute. Set 0 to disable."
+        ),
     )
     parser.add_argument(
         "--skip-oom-scan",
@@ -1430,7 +1501,8 @@ def compute_loss(
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
-    feature = feature.to(device)
+    if feature.device != device:
+        feature = feature.to(device, non_blocking=True)
 
     supervisions = batch["supervisions"]
     num_seqs = int(feature.size(0))
@@ -2070,7 +2142,21 @@ def train_one_epoch(
             rank_phase_profile_sync,
         )
 
-    for batch_idx, batch in enumerate(train_dl):
+    model_device = next(model.parameters()).device
+    feature_prefetch_batches = max(0, int(getattr(params, "feature_prefetch_batches", 0)))
+    if rank == 0:
+        logging.info(
+            "Feature prefetch: batches=%s (device=%s)",
+            feature_prefetch_batches,
+            model_device,
+        )
+    train_iter = _iter_with_feature_prefetch(
+        train_dl,
+        device=model_device,
+        num_prefetch_batches=feature_prefetch_batches,
+    )
+
+    for batch_idx, batch in enumerate(train_iter):
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
         compute_start = iter_start

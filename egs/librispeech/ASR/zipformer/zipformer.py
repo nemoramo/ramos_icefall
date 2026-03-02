@@ -354,6 +354,20 @@ class Zipformer2(EncoderInterface):
                 chunk_attn_mask = chunk_attn_mask.unsqueeze(0)
             elif attn_mask.ndim == 2 and chunk_attn_mask.ndim == 3:
                 attn_mask = attn_mask.unsqueeze(0)
+            # Be tolerant to off-by-one sequence mismatches across mask sources.
+            query_len = max(attn_mask.size(-2), chunk_attn_mask.size(-2))
+            key_len = max(attn_mask.size(-1), chunk_attn_mask.size(-1))
+
+            def _align_mask(mask: Tensor) -> Tensor:
+                mask = mask[..., :query_len, :key_len]
+                pad_q = query_len - mask.size(-2)
+                pad_k = key_len - mask.size(-1)
+                if pad_q > 0 or pad_k > 0:
+                    mask = F.pad(mask, (0, pad_k, 0, pad_q), value=False)
+                return mask
+
+            attn_mask = _align_mask(attn_mask)
+            chunk_attn_mask = _align_mask(chunk_attn_mask)
             combined_attn_mask = torch.logical_or(attn_mask, chunk_attn_mask)
 
         for i, module in enumerate(self.encoders):
@@ -2109,6 +2123,26 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         if attn_mask is not None:
             assert attn_mask.dtype == torch.bool
+            # Align mask shape to attention score shape before masking.
+            # Supported mask ranks:
+            #  - [Q, K]
+            #  - [B, Q, K]
+            #  - [H, B, Q, K]
+            if attn_mask.ndim == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.ndim == 3:
+                attn_mask = attn_mask.unsqueeze(0)
+            if attn_mask.ndim != 4:
+                raise ValueError(
+                    f"Unsupported attn_mask ndim={attn_mask.ndim}, expected 2/3/4"
+                )
+            query_len = attn_scores.size(-2)
+            key_len = attn_scores.size(-1)
+            attn_mask = attn_mask[..., :query_len, :key_len]
+            pad_q = query_len - attn_mask.size(-2)
+            pad_k = key_len - attn_mask.size(-1)
+            if pad_q > 0 or pad_k > 0:
+                attn_mask = F.pad(attn_mask, (0, pad_k, 0, pad_q), value=False)
             # use -1000 to avoid nan's where attn_mask and key_padding_mask make
             # all scores zero.  It's important that this be large enough that exp(-1000)
             # is exactly zero, for reasons related to const_attention_rate, it
