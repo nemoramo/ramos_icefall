@@ -416,7 +416,109 @@ queue_size = 16  (内存紧张，接受轻微 stall)
 | `--max-cuts` | 固定 max-cuts 是 Node Producer 高效工作的前提，保证每 step shape 稳定 |
 | `--feature-prefetch-batches` | Node Producer 负责 CPU->CPU 的 batch 预取，feature_prefetch_batches 负责 CPU->GPU 的异步拷贝，两者是正交叠加的 |
 
-### 9.6 故障排查
+### 9.6 Consumer Batch Replay（消费者批次回放）
+
+当 Producer 生产速度暂时跟不上 Consumer 消费速度时（如 I/O 抖动、packing 计算波动），传统做法是阻塞等待或超时报错，导致 GPU 空闲浪费算力。**Batch Replay** 机制允许 Consumer 在历史 batch 中随机选择并回放，同时保持 GPU 持续训练。
+
+#### 工作原理
+
+```
+Consumer 尝试从 Queue 取数据
+        ↓
+    Queue 为空 → 开始计时等待
+        ↓
+    等待超过阈值 (如 500ms)
+        ↓
+    检查 replay 触发条件（多层级防护）
+        ↓
+    从最近 N 个 batch 中随机选择一个
+        ↓
+    进行数据增强（shuffle cuts + shuffle tracks）
+        ↓
+    作为 "replay_batch" 返回给 GPU
+```
+
+**Replay 触发条件（必须全部满足）：**
+
+| 条件 | 默认值 | 说明 |
+|------|--------|------|
+| `replay_on_empty` | False | 功能总开关 |
+| 等待时间 | 500ms | 必须超过 `replay_wait_threshold_ms` |
+| 缓冲区非空 | - | 最近 batch 缓存区有数据 |
+| 最小间隔步数 | 100 steps | 两次 replay 间隔至少 100 个正常 batch |
+| 全局比例上限 | 3% | replay 样本占当前 epoch 总样本比例上限 |
+| 概率抽样 | 25% | 满足以上条件后，以 `replay_prob` 概率触发 |
+
+**Replay 数据增强：**
+
+回放的 batch 不是原样返回，而是进行轻微数据增强，相当于提供"新的"训练样本：
+
+1. **Shuffle packed-cut 顺序**：改变 batch 内各 packed cut 的顺序
+2. **Shuffle tracks（utterance 顺序）**：对每个 MixedCut，打乱内部拼接的 utterance 顺序，但保持原始 gap 间隔
+
+示例：
+- 原 batch: `[cut_A(3条语音拼接), cut_B(2条语音拼接)]`
+- Replay 后: `[cut_B'(内部2条语音顺序打乱), cut_A'(内部3条语音顺序打乱)]`
+
+#### Replay 参数详解
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--node-data-producer-replay-on-empty` | bool | False | **总开关**：是否启用 batch replay |
+| `--node-data-producer-replay-wait-threshold-ms` | float | 500.0 | 触发 replay 的等待时间阈值（毫秒）|
+| `--node-data-producer-replay-buffer-size` | int | 8 | 保存最近 batch 的缓冲区大小 |
+| `--node-data-producer-replay-prob` | float | 0.25 | 满足条件时触发 replay 的概率 |
+| `--node-data-producer-replay-min-interval-steps` | int | 100 | 两次 replay 之间的最小步数间隔 |
+| `--node-data-producer-replay-max-ratio` | float | 0.03 | 当前 epoch 中 replay 占总样本的最大比例（0.03=3%）|
+
+#### 启用与配置示例
+
+**基础启用：**
+```bash
+cd egs/france/ASR
+NODE_DATA_PRODUCER_REPLAY_ON_EMPTY=1 ./run_french_150M.sh
+```
+
+**激进配置（Producer 严重滞后场景）：**
+```bash
+NODE_DATA_PRODUCER_REPLAY_ON_EMPTY=1 \
+NODE_DATA_PRODUCER_REPLAY_WAIT_THRESHOLD_MS=200 \
+NODE_DATA_PRODUCER_REPLAY_PROB=0.5 \
+NODE_DATA_PRODUCER_REPLAY_MAX_RATIO=0.05 \
+NODE_DATA_PRODUCER_REPLAY_MIN_INTERVAL_STEPS=50 \
+./run_french_150M.sh
+```
+
+**保守配置（仅极端情况才 replay）：**
+```bash
+NODE_DATA_PRODUCER_REPLAY_ON_EMPTY=1 \
+NODE_DATA_PRODUCER_REPLAY_WAIT_THRESHOLD_MS=1000 \
+NODE_DATA_PRODUCER_REPLAY_PROB=0.1 \
+NODE_DATA_PRODUCER_REPLAY_MAX_RATIO=0.01 \
+./run_french_150M.sh
+```
+
+#### 使用建议与注意事项
+
+**何时启用：**
+- 观察到训练过程中有频繁的 `consumer_wait_ms` 尖峰（通过 dashboard）
+- GPU util 不稳定，出现周期性下降
+- Producer 因 I/O 波动或 packing 计算量波动而偶发卡顿
+
+**监控指标：**
+- 通过 dashboard 观察各 rank 的 `consumer_replay_count_per_rank`
+- 如果某个 rank 的 replay 频率持续高于 5%，说明 producer 瓶颈严重，应从源头解决：
+  1. 增大 `--node-data-producer-queue-size`
+  2. 优化 packing 参数（增大 `--pack-raw-pool-size`）
+  3. 增加 I/O 并发（增大 `--num-workers` 和 `--prefetch-factor`）
+
+**注意事项：**
+- replay 相当于数据增强，理论上不会损害模型质量
+- 但 replay 的样本没有新的音频数据，只是重新排列组合已有样本
+- replay 比例应控制在 5% 以内，过高则说明需要优化 producer 性能
+- replay 会略微增加 CPU 开销（shuffle cuts 和 tracks），但通常可忽略
+
+### 9.7 故障排查
 
 **Producer 卡死/无输出：**
 ```bash
@@ -425,6 +527,9 @@ tail -f exp/xxx/node_producer_metrics.jsonl
 
 # 查看 queue depth 是否一直为 0
 grep "queue_depth" exp/xxx/node_producer_metrics.jsonl | tail
+
+# 查看是否有 replay 计数在增加（说明 consumer 在等数据）
+grep "consumer_replay_count" exp/xxx/node_producer_metrics.jsonl | tail
 ```
 
 **Consumer 超时：**
@@ -436,6 +541,7 @@ NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC=60 ./run_french_150M.sh
 **某个 rank 消费明显慢于其他 rank：**
 - 检查该 rank 的 GPU util（可能是模型 forward 有瓶颈）
 - 检查 `consumer_wait_ms_per_rank` 是否异常高（可能是该 rank 的 DataLoader 进程问题）
+- 检查 `consumer_replay_count_per_rank` 是否明显高于其他 rank（该 rank 经常"饿"）
 
 ## 10. 与当前 launcher 对齐的最小启动参数（2026-03）
 

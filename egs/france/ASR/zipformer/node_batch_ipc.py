@@ -43,6 +43,7 @@ def create_node_batch_ipc(
     for r in range(int(world_size)):
         metrics[f"consumed_step_rank{r}"] = -1
         metrics[f"consumer_wait_ms_rank{r}"] = 0.0
+        metrics[f"consumer_replay_count_rank{r}"] = 0
 
     ipc = NodeBatchIPC(
         world_size=int(world_size),
@@ -70,4 +71,3 @@ def set_producer_error(ipc: NodeBatchIPC, message: str) -> None:
         ipc.producer_error["message"] = str(message)
     except Exception:
         pass
-

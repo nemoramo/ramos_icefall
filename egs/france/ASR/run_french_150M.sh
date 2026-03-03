@@ -101,6 +101,15 @@ NODE_DATA_PRODUCER_HEARTBEAT_SEC="${NODE_DATA_PRODUCER_HEARTBEAT_SEC:-2}"
 NODE_DATA_PRODUCER_BLOCK_ON_EMPTY="${NODE_DATA_PRODUCER_BLOCK_ON_EMPTY:-1}"
 NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC="${NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC:-0}"
 NODE_DATA_PRODUCER_METRICS_OUT="${NODE_DATA_PRODUCER_METRICS_OUT:-}"
+# Replay-on-empty fallback (off by default):
+# If consumer waits on empty queue for too long, it may replay a recent batch
+# with shuffled packed-cut/track order, subject to strict frequency caps.
+NODE_DATA_PRODUCER_REPLAY_ON_EMPTY="${NODE_DATA_PRODUCER_REPLAY_ON_EMPTY:-0}"
+NODE_DATA_PRODUCER_REPLAY_WAIT_THRESHOLD_MS="${NODE_DATA_PRODUCER_REPLAY_WAIT_THRESHOLD_MS:-500}"
+NODE_DATA_PRODUCER_REPLAY_BUFFER_SIZE="${NODE_DATA_PRODUCER_REPLAY_BUFFER_SIZE:-8}"
+NODE_DATA_PRODUCER_REPLAY_PROB="${NODE_DATA_PRODUCER_REPLAY_PROB:-0.25}"
+NODE_DATA_PRODUCER_REPLAY_MIN_INTERVAL_STEPS="${NODE_DATA_PRODUCER_REPLAY_MIN_INTERVAL_STEPS:-100}"
+NODE_DATA_PRODUCER_REPLAY_MAX_RATIO="${NODE_DATA_PRODUCER_REPLAY_MAX_RATIO:-0.03}"
 
 python ./zipformer/train.py \
   --world-size "${WORLD_SIZE}" \
@@ -157,6 +166,12 @@ python ./zipformer/train.py \
   --node-data-producer-block-on-empty "${NODE_DATA_PRODUCER_BLOCK_ON_EMPTY}" \
   --node-data-producer-block-timeout-sec "${NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC}" \
   --node-data-producer-metrics-out "${NODE_DATA_PRODUCER_METRICS_OUT}" \
+  --node-data-producer-replay-on-empty "${NODE_DATA_PRODUCER_REPLAY_ON_EMPTY}" \
+  --node-data-producer-replay-wait-threshold-ms "${NODE_DATA_PRODUCER_REPLAY_WAIT_THRESHOLD_MS}" \
+  --node-data-producer-replay-buffer-size "${NODE_DATA_PRODUCER_REPLAY_BUFFER_SIZE}" \
+  --node-data-producer-replay-prob "${NODE_DATA_PRODUCER_REPLAY_PROB}" \
+  --node-data-producer-replay-min-interval-steps "${NODE_DATA_PRODUCER_REPLAY_MIN_INTERVAL_STEPS}" \
+  --node-data-producer-replay-max-ratio "${NODE_DATA_PRODUCER_REPLAY_MAX_RATIO}" \
   --num-encoder-layers 2,2,4,5,4,2 \
   --feedforward-dim 512,768,1536,2048,1536,768 \
   --encoder-dim 192,256,512,768,512,256 \

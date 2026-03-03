@@ -702,6 +702,51 @@ class MSR_AsrDataModule:
             default=2,
             help="Heartbeat cadence (seconds) for producer-side metrics updates.",
         )
+        group.add_argument(
+            "--node-data-producer-replay-on-empty",
+            type=str2bool,
+            default=False,
+            help=(
+                "If True, when consumer queue is empty for long enough, allow replaying "
+                "a recent rank-local batch (with shuffled order) to reduce GPU idle time."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-replay-wait-threshold-ms",
+            type=float,
+            default=500.0,
+            help=(
+                "Only allow replay fallback after this much queue wait (milliseconds)."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-replay-buffer-size",
+            type=int,
+            default=8,
+            help="How many recent rank-local batches are kept for replay fallback.",
+        )
+        group.add_argument(
+            "--node-data-producer-replay-prob",
+            type=float,
+            default=0.25,
+            help="Per-empty-wait trigger probability of using replay fallback (0~1).",
+        )
+        group.add_argument(
+            "--node-data-producer-replay-min-interval-steps",
+            type=int,
+            default=100,
+            help=(
+                "Minimum consumed-step interval between two replay fallback batches."
+            ),
+        )
+        group.add_argument(
+            "--node-data-producer-replay-max-ratio",
+            type=float,
+            default=0.03,
+            help=(
+                "Maximum replay fallback ratio within an epoch (e.g., 0.03 means <=3%)."
+            ),
+        )
 
     def _build_pack_sampler(
         self,
@@ -923,6 +968,32 @@ class MSR_AsrDataModule:
                     ),
                     block_timeout_sec=float(
                         getattr(self.args, "node_data_producer_block_timeout_sec", 0)
+                    ),
+                    replay_on_empty=bool(
+                        getattr(self.args, "node_data_producer_replay_on_empty", False)
+                    ),
+                    replay_wait_threshold_ms=float(
+                        getattr(
+                            self.args,
+                            "node_data_producer_replay_wait_threshold_ms",
+                            500.0,
+                        )
+                    ),
+                    replay_buffer_size=int(
+                        getattr(self.args, "node_data_producer_replay_buffer_size", 8)
+                    ),
+                    replay_prob=float(
+                        getattr(self.args, "node_data_producer_replay_prob", 0.25)
+                    ),
+                    replay_min_interval_steps=int(
+                        getattr(
+                            self.args,
+                            "node_data_producer_replay_min_interval_steps",
+                            100,
+                        )
+                    ),
+                    replay_max_ratio=float(
+                        getattr(self.args, "node_data_producer_replay_max_ratio", 0.03)
                     ),
                 )
             elif use_ddp_pack_sampler:

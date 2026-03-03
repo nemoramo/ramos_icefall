@@ -84,6 +84,10 @@ class NodeBatchProducer:
             float(self.ipc.metrics.get(f"consumer_wait_ms_rank{r}", 0.0))
             for r in range(int(self.ipc.world_size))
         ]
+        replays = [
+            int(self.ipc.metrics.get(f"consumer_replay_count_rank{r}", 0))
+            for r in range(int(self.ipc.world_size))
+        ]
 
         valid = [x for x in consumed if x >= 0]
         lag_steps = (max(valid) - min(valid)) if valid else 0
@@ -107,6 +111,7 @@ class NodeBatchProducer:
             "queue_depth_per_rank": depths,
             "consumed_step_per_rank": consumed,
             "consumer_wait_ms_per_rank": waits,
+            "consumer_replay_count_per_rank": replays,
             "lag_steps": int(lag_steps),
         }
 
