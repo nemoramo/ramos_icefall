@@ -1755,6 +1755,7 @@ def compute_validation_loss(
     asr_model = model.module if isinstance(model, DDP) else model
     device = next(asr_model.parameters()).device
     warned_packed_valid_wer = False
+    skipped_valid_audio_batches = 0
 
     # Make validation deterministic w.r.t. chunking.
     #
@@ -1815,6 +1816,18 @@ def compute_validation_loss(
     try:
         with torch.no_grad():
             for batch_idx, batch in enumerate(valid_dl):
+                if batch is None:
+                    skipped_valid_audio_batches += 1
+                    if (
+                        skipped_valid_audio_batches <= 10
+                        or skipped_valid_audio_batches % 100 == 0
+                    ):
+                        logging.warning(
+                            "Skipping validation batch due to unreadable audio "
+                            "(count=%s).",
+                            skipped_valid_audio_batches,
+                        )
+                    continue
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -1896,6 +1909,11 @@ def compute_validation_loss(
         batch_idx + 1 if "batch_idx" in locals() else 0,
         valid_time / (batch_idx + 1) if "batch_idx" in locals() else 0.0,
     )
+    if skipped_valid_audio_batches > 0:
+        logging.warning(
+            "Validation skipped %s batch(es) due to unreadable audio.",
+            skipped_valid_audio_batches,
+        )
 
     if world_size > 1:
         tot_loss.reduce(device)
@@ -1908,7 +1926,11 @@ def compute_validation_loss(
             torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
             tot_errs, tot_ref_len, tot_ins, tot_del, tot_sub = stats.cpu().tolist()
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = (
+        tot_loss["loss"] / tot_loss["frames"]
+        if tot_loss["frames"] > 0
+        else float("inf")
+    )
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
@@ -2133,6 +2155,7 @@ def train_one_epoch(
         getattr(params, "rank_phase_profile_cuda_sync", False)
     )
     rank_phase_topk_records: List[Dict[str, Any]] = []
+    skipped_train_audio_batches = 0
     if rank_phase_profile_enabled and rank == 0:
         logging.info(
             "Rank phase profiling enabled: interval=%s topk=%s out=%s sync=%s",
@@ -2160,6 +2183,21 @@ def train_one_epoch(
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
         compute_start = iter_start
+
+        if batch is None:
+            skipped_train_audio_batches += 1
+            if (
+                skipped_train_audio_batches <= 20
+                or skipped_train_audio_batches % 100 == 0
+            ):
+                logging.warning(
+                    "Skipping training batch due to unreadable audio "
+                    "(count=%s, local_batch=%s).",
+                    skipped_train_audio_batches,
+                    batch_idx,
+                )
+            prev_step_end = time.perf_counter()
+            continue
 
         if batch_idx % 10 == 0:
             set_batch_count(model, get_adjusted_batch_count(params))
@@ -2874,8 +2912,18 @@ def train_one_epoch(
             json.dumps(topk_summary, ensure_ascii=True, indent=2) + "\n",
             encoding="utf-8",
         )
+    if skipped_train_audio_batches > 0:
+        logging.warning(
+            "Epoch %s skipped %s training batch(es) due to unreadable audio.",
+            params.cur_epoch,
+            skipped_train_audio_batches,
+        )
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = (
+        tot_loss["loss"] / tot_loss["frames"]
+        if tot_loss["frames"] > 0
+        else float("inf")
+    )
     params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
@@ -3241,6 +3289,12 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
+        if batch is None:
+            logging.warning(
+                "Skipping pessimistic batch check for criterion=%s due to unreadable audio.",
+                criterion,
+            )
+            continue
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, _ = compute_loss(

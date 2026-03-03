@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import torch
 from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
+from lhotse.audio.utils import AudioLoadingError
 from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
     CutConcatenate,
     CutMix,
@@ -40,7 +41,7 @@ from lhotse.dataset.input_strategies import (  # noqa F401 For AudioSamples
     OnTheFlyFeatures,
 )
 from lhotse.utils import fix_random_seed
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from icefall.utils import str2bool
 
@@ -53,6 +54,68 @@ class _SeedWorkers:
 
     def __call__(self, worker_id: int):
         fix_random_seed(self.seed + worker_id)
+
+
+def _is_readable_audio_error(exc: Exception) -> bool:
+    if isinstance(exc, AudioLoadingError):
+        return True
+    if isinstance(exc, (FileNotFoundError, IsADirectoryError, PermissionError)):
+        return True
+    msg = str(exc).lower()
+    patterns = (
+        "audio loading",
+        "format not recognised",
+        "failed to create audiodecoder",
+        "could not open input file",
+        "error opening",
+        "is a directory",
+    )
+    return any(p in msg for p in patterns)
+
+
+class _FaultTolerantSpeechDataset(Dataset):
+    """Wrap K2SpeechRecognitionDataset and skip unreadable-audio batches."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        split: str,
+        enabled: bool,
+        max_warnings: int,
+    ) -> None:
+        self.dataset = dataset
+        self.split = split
+        self.enabled = enabled
+        self.max_warnings = max(0, int(max_warnings))
+        self._skipped = 0
+        self._warned = 0
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, item):
+        if not self.enabled:
+            return self.dataset[item]
+        try:
+            return self.dataset[item]
+        except Exception as ex:
+            if not _is_readable_audio_error(ex):
+                raise
+            self._skipped += 1
+            should_warn = (
+                self._warned < self.max_warnings
+                or (self._skipped % 100 == 0 and self.max_warnings > 0)
+            )
+            if should_warn:
+                self._warned += 1
+                logging.warning(
+                    "[%s] Skipping batch due to unreadable audio (skipped=%s): %s",
+                    self.split,
+                    self._skipped,
+                    repr(ex),
+                )
+            return None
 
 
 class MSR_AsrDataModule:
@@ -457,6 +520,24 @@ class MSR_AsrDataModule:
             help="How many cuts (per manifest) to sample for audio-path backend validation. Set 0 to disable.",
         )
         group.add_argument(
+            "--skip-unreadable-audio",
+            type=str2bool,
+            default=True,
+            help=(
+                "If True, skip unreadable/corrupted audio batches instead of "
+                "failing the whole training job."
+            ),
+        )
+        group.add_argument(
+            "--unreadable-audio-max-warnings",
+            type=int,
+            default=50,
+            help=(
+                "Maximum warning count for skipped unreadable-audio batches "
+                "(per worker process)."
+            ),
+        )
+        group.add_argument(
             "--shuffle",
             type=str2bool,
             default=True,
@@ -666,6 +747,12 @@ class MSR_AsrDataModule:
                 input_transforms=input_transforms,
                 return_cuts=self.args.return_cuts,
             )
+        train = _FaultTolerantSpeechDataset(
+            train,
+            split="train",
+            enabled=bool(getattr(self.args, "skip_unreadable_audio", True)),
+            max_warnings=int(getattr(self.args, "unreadable_audio_max_warnings", 50)),
+        )
 
         if self.args.bucketing_sampler:
             logging.info("Using DynamicBucketingSampler.")
@@ -804,6 +891,12 @@ class MSR_AsrDataModule:
                 cut_transforms=transforms,
                 return_cuts=self.args.return_cuts,
             )
+        validate = _FaultTolerantSpeechDataset(
+            validate,
+            split="valid",
+            enabled=bool(getattr(self.args, "skip_unreadable_audio", True)),
+            max_warnings=int(getattr(self.args, "unreadable_audio_max_warnings", 50)),
+        )
         valid_sampler = DynamicBucketingSampler(
             cuts_valid,
             max_duration=self.args.max_duration,
@@ -833,6 +926,12 @@ class MSR_AsrDataModule:
             if self.args.on_the_fly_feats
             else eval(self.args.input_strategy)(),
             return_cuts=self.args.return_cuts,
+        )
+        test = _FaultTolerantSpeechDataset(
+            test,
+            split="test",
+            enabled=bool(getattr(self.args, "skip_unreadable_audio", True)),
+            max_warnings=int(getattr(self.args, "unreadable_audio_max_warnings", 50)),
         )
         sampler = DynamicBucketingSampler(
             cuts,
