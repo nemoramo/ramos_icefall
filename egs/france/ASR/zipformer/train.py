@@ -54,6 +54,7 @@ It supports training with:
 import argparse
 import contextlib
 import copy
+import inspect
 import json
 import logging
 import os
@@ -79,6 +80,8 @@ from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import AsrModel
+from node_batch_ipc import NodeBatchIPC, create_node_batch_ipc
+from node_batch_producer import NodeBatchProducer
 from optim import Eden, ScaledAdam
 from scaling import ScheduledFloat
 from subsampling import Conv2dSubsampling
@@ -1143,14 +1146,26 @@ def get_parser():
     parser.add_argument(
         "--average-period",
         type=int,
-        default=200,
+        default=1000,
         help="""Update the averaged model, namely `model_avg`, after processing
         this number of batches. `model_avg` is a separate version of model,
         in which each floating-point parameter is the average of all the
         parameters from the start of training. Each time we take the average,
         we do: `model_avg = model * (average_period / batch_idx_train) +
             model_avg * ((batch_idx_train - average_period) / batch_idx_train)`.
+        A larger value reduces rank-0 periodic stalls from averaging.
         """,
+    )
+    parser.add_argument(
+        "--model-avg-device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "same"],
+        help=(
+            "Device for model_avg on rank 0. "
+            "'cpu' reduces GPU interference from averaging; "
+            "'same' keeps model_avg on the training device."
+        ),
     )
 
     parser.add_argument(
@@ -1555,7 +1570,7 @@ def compute_loss(
         # Newer AsrModel returns (simple_loss, pruned_loss, ctc_loss,
         # attention_decoder_loss, cr_loss). We don't use CR-CTC here, so ignore it.
         if return_phase_stats:
-            model_out = model(
+            model_kwargs = dict(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
@@ -1566,19 +1581,41 @@ def compute_loss(
                 packed_supervision_segments=packed_supervision_segments
                 if use_packed
                 else None,
-                return_timing=True,
-                timing_cuda_sync=bool(
-                    getattr(params, "rank_phase_profile_cuda_sync", False)
-                ),
             )
-            (
-                simple_loss,
-                pruned_loss,
-                ctc_loss,
-                attention_decoder_loss,
-                _cr_loss,
-                phase_timing,
-            ) = model_out
+            supports_timing = getattr(params, "_model_supports_return_timing", None)
+            if supports_timing is None:
+                try:
+                    target_model = model.module if hasattr(model, "module") else model
+                    sig = inspect.signature(target_model.forward)
+                    supports_timing = "return_timing" in sig.parameters
+                except Exception:
+                    supports_timing = False
+                params._model_supports_return_timing = bool(supports_timing)
+                if not supports_timing and int(getattr(params, "rank", 0)) == 0:
+                    logging.warning(
+                        "rank-phase-profile enabled but model.forward does not support "
+                        "`return_timing`; falling back to coarse phase stats."
+                    )
+
+            if supports_timing:
+                model_kwargs["return_timing"] = True
+                model_kwargs["timing_cuda_sync"] = bool(
+                    getattr(params, "rank_phase_profile_cuda_sync", False)
+                )
+
+            model_out = model(**model_kwargs)
+            if isinstance(model_out, tuple) and len(model_out) >= 5:
+                simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, _cr_loss = (
+                    model_out[:5]
+                )
+                if supports_timing and len(model_out) >= 6 and isinstance(
+                    model_out[5], dict
+                ):
+                    phase_timing = model_out[5]
+            else:
+                raise RuntimeError(
+                    "Unexpected model output format in compute_loss(return_phase_stats=True)"
+                )
         else:
             simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, _cr_loss = model(
                 x=feature,
@@ -2931,7 +2968,12 @@ def train_one_epoch(
     return params.max_train_steps > 0 and params.batch_idx_train >= params.max_train_steps
 
 
-def run(rank, world_size, args):
+def run(
+    rank: int,
+    world_size: int,
+    args,
+    node_data_ipc: Optional[NodeBatchIPC] = None,
+):
     """
     Args:
       rank:
@@ -2942,12 +2984,20 @@ def run(rank, world_size, args):
         Number of GPUs for DDP training.
       args:
         The return value of get_parser().parse_args()
+      node_data_ipc:
+        Shared IPC object for node-level producer/consumer mode.
     """
     params = get_params()
     params.update(vars(args))
     # Expose distributed rank/world_size to data module for sampler sharding.
     args.rank = rank
     args.world_size = world_size
+    node_data_enabled = (
+        bool(getattr(args, "node_data_producer", False)) and int(world_size) > 1
+    )
+    if node_data_enabled and node_data_ipc is None:
+        raise ValueError("--node-data-producer is enabled but node_data_ipc is missing.")
+    node_producer: Optional[NodeBatchProducer] = None
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -3023,6 +3073,21 @@ def run(rank, world_size, args):
     if rank == 0:
         # model_avg is only used with rank 0
         model_avg = copy.deepcopy(model).to(torch.float64)
+        model_avg_device = str(getattr(params, "model_avg_device", "cpu")).lower()
+        if model_avg_device == "cpu":
+            model_avg = model_avg.to(torch.device("cpu"))
+        elif model_avg_device == "same":
+            model_avg = model_avg.to(device)
+        else:
+            raise ValueError(
+                f"Unsupported --model-avg-device={params.model_avg_device}. "
+                "Use 'cpu' or 'same'."
+            )
+        logging.info(
+            "Rank %s: model_avg device=%s",
+            rank,
+            next(model_avg.parameters()).device,
+        )
 
     assert params.start_epoch > 0, params.start_epoch
     checkpoints = load_checkpoint_if_available(
@@ -3149,9 +3214,42 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = msr.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
+    if node_data_enabled:
+        metrics_out = str(getattr(params, "node_data_producer_metrics_out", "")).strip()
+        if metrics_out == "":
+            metrics_out = str(Path(params.exp_dir) / "node_producer_metrics.jsonl")
+
+        if rank == 0:
+            producer_sampler = msr.build_node_producer_sampler(
+                train_cuts, sampler_state_dict=sampler_state_dict
+            )
+            node_producer = NodeBatchProducer(
+                sampler=producer_sampler,
+                ipc=node_data_ipc,
+                metrics_out=Path(metrics_out),
+                log_interval_sec=float(
+                    getattr(params, "node_data_producer_log_interval", 20)
+                ),
+                heartbeat_sec=float(
+                    getattr(params, "node_data_producer_heartbeat_sec", 2)
+                ),
+            )
+            node_producer.start()
+            logging.info(
+                "Node data producer started: metrics_out=%s queue_size=%s",
+                metrics_out,
+                int(getattr(params, "node_data_producer_queue_size", 32)),
+            )
+
+        train_dl = msr.train_dataloaders(
+            train_cuts,
+            sampler_state_dict=None,
+            node_data_ipc=node_data_ipc,
+        )
+    else:
+        train_dl = msr.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
 
     valid_cuts = msr.dev_cuts()
     max_valid_dur = float(getattr(params, "max_valid_cut_duration", 0.0))
@@ -3190,50 +3288,60 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
-        scheduler.step_epoch(epoch - 1)
-        fix_random_seed(params.seed + epoch - 1)
-        train_dl.sampler.set_epoch(epoch - 1)
+    try:
+        for epoch in range(params.start_epoch, params.num_epochs + 1):
+            scheduler.step_epoch(epoch - 1)
+            fix_random_seed(params.seed + epoch - 1)
+            train_dl.sampler.set_epoch(epoch - 1)
 
-        if tb_writer is not None:
-            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+            if node_data_enabled and rank == 0 and node_producer is not None:
+                node_producer.request_epoch(epoch - 1)
+            if node_data_enabled and world_size > 1:
+                torch.distributed.barrier()
 
-        params.cur_epoch = epoch
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
 
-        reached_max_steps = train_one_epoch(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sp=sp,
-            train_dl=train_dl,
-            valid_dl=valid_dl,
-            scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
-            rank=rank,
-        )
+            params.cur_epoch = epoch
 
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-
-        save_checkpoint(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler,
-            scaler=scaler,
-            rank=rank,
-        )
-        if reached_max_steps:
-            logging.info(
-                f"Stopped at global batch_idx_train={params.batch_idx_train} due to max_train_steps."
+            reached_max_steps = train_one_epoch(
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sp=sp,
+                train_dl=train_dl,
+                valid_dl=valid_dl,
+                scaler=scaler,
+                tb_writer=tb_writer,
+                world_size=world_size,
+                rank=rank,
             )
-            break
+
+            if params.print_diagnostics:
+                diagnostic.print_diagnostics()
+                break
+
+            save_checkpoint(
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=train_dl.sampler,
+                scaler=scaler,
+                rank=rank,
+            )
+            if reached_max_steps:
+                logging.info(
+                    f"Stopped at global batch_idx_train={params.batch_idx_train} due to max_train_steps."
+                )
+                break
+    finally:
+        if node_data_enabled and rank == 0 and node_producer is not None:
+            logging.info("Stopping node data producer.")
+            node_producer.stop(set_stop_event=False)
 
     logging.info("Done!")
 
@@ -3330,6 +3438,20 @@ def main():
 
     world_size = args.world_size
     assert world_size >= 1
+    node_data_ipc: Optional[NodeBatchIPC] = None
+    node_data_manager = None
+    if bool(getattr(args, "node_data_producer", False)):
+        if world_size <= 1:
+            print(
+                "--node-data-producer requires --world-size > 1; disabling it for single-GPU run."
+            )
+            args.node_data_producer = False
+        else:
+            node_data_ipc, node_data_manager = create_node_batch_ipc(
+                world_size=int(world_size),
+                queue_size=int(getattr(args, "node_data_producer_queue_size", 32)),
+            )
+
     if world_size > 1:
         # Avoid failing DDP init with "EADDRINUSE" when the chosen master port is
         # already occupied by another job on the same host.
@@ -3360,9 +3482,14 @@ def main():
 
             os.environ["MASTER_PORT"] = str(args.master_port)
 
-        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+        mp.spawn(
+            run,
+            args=(world_size, args, node_data_ipc),
+            nprocs=world_size,
+            join=True,
+        )
     else:
-        run(rank=0, world_size=1, args=args)
+        run(rank=0, world_size=1, args=args, node_data_ipc=None)
 
 
 torch.set_num_threads(1)

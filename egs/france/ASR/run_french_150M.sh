@@ -58,6 +58,8 @@ NUM_EPOCHS="${NUM_EPOCHS:-80}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20000}"
 START_EPOCH="${START_EPOCH:-1}"
 START_BATCH="${START_BATCH:-0}"
+AVERAGE_PERIOD="${AVERAGE_PERIOD:-1000}"
+MODEL_AVG_DEVICE="${MODEL_AVG_DEVICE:-cpu}"
 # Rank-phase profiling (cross-rank wait attribution).
 RANK_PHASE_PROFILE="${RANK_PHASE_PROFILE:-0}"
 RANK_PHASE_PROFILE_INTERVAL="${RANK_PHASE_PROFILE_INTERVAL:-50}"
@@ -91,6 +93,14 @@ COMPUTE_VALID_WER="${COMPUTE_VALID_WER:-1}"
 # Limit WER validation cost; 0 means full validation set.
 VALID_WER_MAX_BATCHES="${VALID_WER_MAX_BATCHES:-100}"
 WER_LOWERCASE="${WER_LOWERCASE:-1}"
+USE_FLASH_ATTENTION_TRAIN="${USE_FLASH_ATTENTION_TRAIN:-0}"
+NODE_DATA_PRODUCER="${NODE_DATA_PRODUCER:-0}"
+NODE_DATA_PRODUCER_QUEUE_SIZE="${NODE_DATA_PRODUCER_QUEUE_SIZE:-32}"
+NODE_DATA_PRODUCER_LOG_INTERVAL="${NODE_DATA_PRODUCER_LOG_INTERVAL:-20}"
+NODE_DATA_PRODUCER_HEARTBEAT_SEC="${NODE_DATA_PRODUCER_HEARTBEAT_SEC:-2}"
+NODE_DATA_PRODUCER_BLOCK_ON_EMPTY="${NODE_DATA_PRODUCER_BLOCK_ON_EMPTY:-1}"
+NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC="${NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC:-0}"
+NODE_DATA_PRODUCER_METRICS_OUT="${NODE_DATA_PRODUCER_METRICS_OUT:-}"
 
 python ./zipformer/train.py \
   --world-size "${WORLD_SIZE}" \
@@ -108,6 +118,7 @@ python ./zipformer/train.py \
   --num-buckets "${NUM_BUCKETS}" \
   --causal 1 \
   --use-fp16 1 \
+  --use-flash-attention-train "${USE_FLASH_ATTENTION_TRAIN}" \
   --num-workers "${NUM_WORKERS}" \
   --valid-num-workers "${VALID_NUM_WORKERS}" \
   --bucketing-buffer-size "${BUCKET_BUFFER_SIZE}" \
@@ -120,6 +131,8 @@ python ./zipformer/train.py \
   --rank-phase-profile-cuda-sync "${RANK_PHASE_PROFILE_CUDA_SYNC}" \
   --rank-phase-profile-out "${RANK_PHASE_PROFILE_OUT}" \
   --base-lr "${BASE_LR}" \
+  --average-period "${AVERAGE_PERIOD}" \
+  --model-avg-device "${MODEL_AVG_DEVICE}" \
   --max-train-steps "${MAX_TRAIN_STEPS}" \
   --enable-spec-aug 1 \
   --enable-musan "${ENABLE_MUSAN}" \
@@ -137,6 +150,13 @@ python ./zipformer/train.py \
   --compute-valid-wer "${COMPUTE_VALID_WER}" \
   --valid-wer-max-batches "${VALID_WER_MAX_BATCHES}" \
   --wer-lowercase "${WER_LOWERCASE}" \
+  --node-data-producer "${NODE_DATA_PRODUCER}" \
+  --node-data-producer-queue-size "${NODE_DATA_PRODUCER_QUEUE_SIZE}" \
+  --node-data-producer-log-interval "${NODE_DATA_PRODUCER_LOG_INTERVAL}" \
+  --node-data-producer-heartbeat-sec "${NODE_DATA_PRODUCER_HEARTBEAT_SEC}" \
+  --node-data-producer-block-on-empty "${NODE_DATA_PRODUCER_BLOCK_ON_EMPTY}" \
+  --node-data-producer-block-timeout-sec "${NODE_DATA_PRODUCER_BLOCK_TIMEOUT_SEC}" \
+  --node-data-producer-metrics-out "${NODE_DATA_PRODUCER_METRICS_OUT}" \
   --num-encoder-layers 2,2,4,5,4,2 \
   --feedforward-dim 512,768,1536,2048,1536,768 \
   --encoder-dim 192,256,512,768,512,256 \
