@@ -299,6 +299,32 @@
             content: '◆';
         }
 
+        /* Figure 8: replay fallback diagram */
+        .replay-tier-diagram-container {
+            padding: 1.25rem;
+        }
+
+        .replay-tier-caption {
+            flex-wrap: wrap;
+            line-height: 1.45;
+            text-transform: none;
+            letter-spacing: 0.04em;
+        }
+
+        .replay-tier-diagram-wrap {
+            overflow-x: auto;
+            overflow-y: hidden;
+            border-radius: 10px;
+        }
+
+        .replay-tier-diagram {
+            display: block;
+            width: min(100%, 960px);
+            min-width: 900px;
+            height: auto;
+            margin: 0 auto;
+        }
+
         /* Code blocks */
         .code-block {
             background: var(--bg-code);
@@ -541,6 +567,19 @@
             .stats-grid {
                 grid-template-columns: 1fr;
             }
+
+            .replay-tier-diagram-container {
+                padding: 1rem;
+            }
+
+            .replay-tier-caption {
+                font-size: 0.74rem;
+                letter-spacing: 0.03em;
+            }
+
+            .replay-tier-diagram {
+                min-width: 820px;
+            }
         }
     </style>
 </head>
@@ -564,6 +603,7 @@
                     <a href="#modes" class="nav-item">四种模式</a>
                     <a href="#streaming" class="nav-item">流式训练</a>
                     <a href="#attention" class="nav-item">注意力掩码</a>
+                    <a href="#node-producer" class="nav-item">Node Producer 与 Batch Replay</a>
                     <a href="#params" class="nav-item">关键参数</a>
                 </nav>
             </div>
@@ -762,21 +802,20 @@
                     </svg>
                 </div>
 
-                <div class="code-block">
-<span class="comment"># pack_ddp_sampler.py: 均衡分配算法</span>
+                <pre class="code-block"><span class="comment"># pack_ddp_sampler.py: 均衡分配算法</span>
 <span class="keyword">def</span> <span class="function">split_packed_cuts</span>(packed, world_size):
     <span class="comment"># 1. 按时长降序排序</span>
     cuts.sort(key=<span class="keyword">lambda</span> c: c.duration, reverse=<span class="keyword">True</span>)
-    
+
     <span class="comment"># 2. 目标：每个 rank 分配相同数量的 packed cuts</span>
-    target_counts = [base + (1 <span class="keyword">if</span> r < rem <span class="keyword">else</span> 0) 
+    target_counts = [base + (1 <span class="keyword">if</span> r < rem <span class="keyword">else</span> 0)
                      <span class="keyword">for</span> r <span class="keyword">in</span> range(world_size)]
-    
+
     <span class="comment"># 3. 贪心分配：优先给当前总时长最短的 rank</span>
     <span class="keyword">for</span> cut <span class="keyword">in</span> cuts:
         r = min(candidates, key=<span class="keyword">lambda</span> i: (sum_durs[i], len(parts[i]), i))
         parts[r].append(cut)
-        sum_durs[r] += cut.duration</div>
+        sum_durs[r] += cut.duration</pre>
             </section>
 
             <!-- Modes -->
@@ -1162,18 +1201,17 @@
                     </svg>
                 </div>
 
-                <div class="code-block">
-<span class="comment"># zipformer.py: _get_attn_mask - 流式训练的 mask 生成</span>
+                <pre class="code-block"><span class="comment"># zipformer.py: _get_attn_mask - 流式训练的 mask 生成</span>
 <span class="keyword">def</span> <span class="function">_get_attn_mask</span>(self, x, chunk_size, left_context_chunks):
     <span class="comment"># 计算 chunk id: c = t // chunk_size</span>
     c = t // chunk_size
-    
+
     <span class="comment"># Mask 未来 + 超过限制的过去</span>
     attn_mask = torch.logical_or(
         src_c > tgt_c,                           <span class="comment"># 未来 chunk</span>
         src_c < tgt_c - left_context_chunks      <span class="comment"># 过久远的历史</span>
     )
-    <span class="keyword">return</span> attn_mask</div>
+    <span class="keyword">return</span> attn_mask</pre>
             </section>
 
             <!-- Attention -->
@@ -1260,10 +1298,857 @@
                 </div>
             </section>
 
+            <!-- Node Producer & Batch Replay -->
+            <section class="section" id="node-producer">
+                <div class="section-header">
+                    <span class="section-number">08</span>
+                    <h2>Node Producer 与 Batch Replay</h2>
+                </div>
+
+                <div class="alert alert-info">
+                    <strong>架构升级：</strong>从各 Rank 独立采样过渡到集中式 Node Producer 架构，通过 IPC 队列实现跨 Rank 批次共享，配合 Batch Replay 机制解决 GPU Bubble 问题。
+                </div>
+
+                <h3>架构对比</h3>
+
+                <div class="diagram-container">
+                    <div class="diagram-title">图 6a: 传统 DDP 架构 - 各 Rank 独立采样</div>
+                    <svg viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="0" y="0" width="800" height="380" fill="#0f1623" rx="8"/>
+                        <text x="400" y="25" text-anchor="middle" font-size="14" font-weight="600" fill="#ef4444">传统 DDP: 各 Rank 独立 Packing 产生 Bubble</text>
+                        
+                        <!-- Rank 0 -->
+                        <rect x="30" y="50" width="170" height="120" fill="#1a2332" stroke="#ef4444" stroke-width="2" rx="6"/>
+                        <text x="115" y="70" text-anchor="middle" font-size="11" fill="#f0f4f8" font-weight="600">Rank 0</text>
+                        <text x="115" y="85" text-anchor="middle" font-size="9" fill="#64748b">CutSampler</text>
+                        <rect x="45" y="95" width="60" height="20" fill="#3b82f6" rx="3"/>
+                        <rect x="110" y="95" width="40" height="20" fill="#10b981" rx="3"/>
+                        <rect x="45" y="120" width="70" height="20" fill="#f97316" rx="3"/>
+                        <rect x="120" y="120" width="50" height="20" fill="#a855f7" rx="3"/>
+                        <text x="115" y="160" text-anchor="middle" font-size="10" fill="#ef4444">45 cuts, 8.5s</text>
+                        
+                        <!-- Rank 1 -->
+                        <rect x="215" y="50" width="170" height="120" fill="#1a2332" stroke="#ef4444" stroke-width="2" rx="6"/>
+                        <text x="300" y="70" text-anchor="middle" font-size="11" fill="#f0f4f8" font-weight="600">Rank 1</text>
+                        <text x="300" y="85" text-anchor="middle" font-size="9" fill="#64748b">CutSampler</text>
+                        <rect x="230" y="95" width="50" height="20" fill="#3b82f6" rx="3"/>
+                        <rect x="285" y="95" width="80" height="20" fill="#10b981" rx="3"/>
+                        <rect x="230" y="120" width="60" height="20" fill="#f97316" rx="3"/>
+                        <text x="300" y="160" text-anchor="middle" font-size="10" fill="#10b981">38 cuts, 7.2s ⚡</text>
+                        
+                        <!-- Rank 2 -->
+                        <rect x="400" y="50" width="170" height="120" fill="#1a2332" stroke="#ef4444" stroke-width="2" rx="6"/>
+                        <text x="485" y="70" text-anchor="middle" font-size="11" fill="#f0f4f8" font-weight="600">Rank 2</text>
+                        <text x="485" y="85" text-anchor="middle" font-size="9" fill="#64748b">CutSampler</text>
+                        <rect x="415" y="95" width="70" height="20" fill="#3b82f6" rx="3"/>
+                        <rect x="490" y="95" width="50" height="20" fill="#10b981" rx="3"/>
+                        <rect x="415" y="120" width="60" height="20" fill="#f97316" rx="3"/>
+                        <rect x="480" y="120" width="70" height="20" fill="#a855f7" rx="3"/>
+                        <rect x="415" y="145" width="50" height="15" fill="#ec4899" rx="2"/>
+                        <text x="485" y="160" text-anchor="middle" font-size="10" fill="#ef4444">52 cuts, 9.8s 🐌</text>
+                        
+                        <!-- Rank 3 -->
+                        <rect x="585" y="50" width="170" height="120" fill="#1a2332" stroke="#ef4444" stroke-width="2" rx="6"/>
+                        <text x="670" y="70" text-anchor="middle" font-size="11" fill="#f0f4f8" font-weight="600">Rank 3</text>
+                        <text x="670" y="85" text-anchor="middle" font-size="9" fill="#64748b">CutSampler</text>
+                        <rect x="600" y="95" width="55" height="20" fill="#3b82f6" rx="3"/>
+                        <rect x="660" y="95" width="65" height="20" fill="#10b981" rx="3"/>
+                        <rect x="600" y="120" width="75" height="20" fill="#f97316" rx="3"/>
+                        <text x="670" y="160" text-anchor="middle" font-size="10" fill="#f59e0b">40 cuts, 8.1s</text>
+                        
+                        <!-- Timeline -->
+                        <line x1="30" y1="200" x2="770" y2="200" stroke="#1e293b" stroke-width="2"/>
+                        <text x="30" y="220" font-size="10" fill="#64748b">0s</text>
+                        <text x="400" y="220" text-anchor="middle" font-size="10" fill="#64748b">7.2s</text>
+                        <text x="770" y="220" text-anchor="end" font-size="10" fill="#64748b">9.8s</text>
+                        
+                        <!-- Bubble visualization -->
+                        <rect x="320" y="230" width="430" height="35" fill="#ef4444" opacity="0.15" rx="4"/>
+                        <text x="535" y="252" text-anchor="middle" font-size="12" fill="#ef4444" font-weight="600">⚠ GPU Bubble: Rank 0/1/3 等待 Rank 2</text>
+                        
+                        <!-- Stats -->
+                        <rect x="30" y="280" width="350" height="80" fill="#1a2332" stroke="#ef4444" stroke-width="1" rx="6"/>
+                        <text x="205" y="305" text-anchor="middle" font-size="11" fill="#ef4444" font-weight="600">问题分析</text>
+                        <text x="50" y="325" font-size="10" fill="#94a3b8">• 各 Rank 独立采样，时长分布不均</text>
+                        <text x="50" y="345" font-size="10" fill="#94a3b8">• Packing 后 cuts 数量不一致，总计算量不同</text>
+                        
+                        <rect x="400" y="280" width="370" height="80" fill="#1a2332" stroke="#f59e0b" stroke-width="1" rx="6"/>
+                        <text x="585" y="305" text-anchor="middle" font-size="11" fill="#f59e0b" font-weight="600">影响</text>
+                        <text x="420" y="325" font-size="10" fill="#94a3b8">• 同步等待时间：2.6s (26.5%)</text>
+                        <text x="420" y="345" font-size="10" fill="#94a3b8">• GPU 利用率下降</text>
+                    </svg>
+                </div>
+
+                <div class="diagram-container">
+                    <div class="diagram-title">图 6b: Node Producer 架构 - 集中 Packing + IPC 队列</div>
+                    <svg viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+                            </marker>
+                            <marker id="arrow-cyan" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#00d4ff"/>
+                            </marker>
+                            <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#3b82f6"/>
+                            </marker>
+                            <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#10b981"/>
+                            </marker>
+                            <marker id="arrow-orange" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#f97316"/>
+                            </marker>
+                            <marker id="arrow-purple" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#a855f7"/>
+                            </marker>
+                        </defs>
+                        <rect x="0" y="0" width="800" height="420" fill="#0f1623" rx="8"/>
+                        <text x="400" y="25" text-anchor="middle" font-size="14" font-weight="600" fill="#10b981">Node Producer: 集中 Packing + 均衡分配 (无 Bubble)</text>
+                        
+                        <!-- NodeBatchProducer -->
+                        <rect x="30" y="45" width="300" height="140" fill="#1a2332" stroke="#00d4ff" stroke-width="2" rx="8"/>
+                        <text x="180" y="65" text-anchor="middle" font-size="12" fill="#00d4ff" font-weight="600">● NodeBatchProducer (独立线程)</text>
+                        
+                        <!-- Producer internals -->
+                        <rect x="45" y="80" width="80" height="50" fill="#0f1623" stroke="#3b82f6" rx="4"/>
+                        <text x="85" y="100" text-anchor="middle" font-size="9" fill="#f0f4f8">PackAware</text>
+                        <text x="85" y="115" text-anchor="middle" font-size="8" fill="#64748b">Sampler</text>
+                        
+                        <rect x="135" y="80" width="80" height="50" fill="#0f1623" stroke="#f59e0b" rx="4"/>
+                        <text x="175" y="100" text-anchor="middle" font-size="9" fill="#f0f4f8">CutConcat</text>
+                        <text x="175" y="115" text-anchor="middle" font-size="8" fill="#64748b">enate</text>
+                        
+                        <rect x="225" y="80" width="90" height="50" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <text x="270" y="100" text-anchor="middle" font-size="9" fill="#f0f4f8">均衡分配</text>
+                        <text x="270" y="115" text-anchor="middle" font-size="8" fill="#64748b">split_packed_cuts</text>
+                        
+                        <!-- Output batches -->
+                        <rect x="45" y="140" width="55" height="35" fill="#10b981" opacity="0.3" stroke="#10b981" rx="3"/>
+                        <text x="72" y="162" text-anchor="middle" font-size="8" fill="#10b981">Batch #0</text>
+                        
+                        <rect x="110" y="140" width="55" height="35" fill="#10b981" opacity="0.3" stroke="#10b981" rx="3"/>
+                        <text x="137" y="162" text-anchor="middle" font-size="8" fill="#10b981">Batch #1</text>
+                        
+                        <rect x="175" y="140" width="55" height="35" fill="#10b981" opacity="0.3" stroke="#10b981" rx="3"/>
+                        <text x="202" y="162" text-anchor="middle" font-size="8" fill="#10b981">Batch #2</text>
+                        
+                        <rect x="240" y="140" width="55" height="35" fill="#10b981" opacity="0.3" stroke="#10b981" rx="3"/>
+                        <text x="267" y="162" text-anchor="middle" font-size="8" fill="#10b981">Batch #3</text>
+                        
+                        <!-- NodeBatchIPC (Queue) -->
+                        <rect x="350" y="45" width="100" height="320" fill="#1a2332" stroke="#a855f7" stroke-width="2" rx="8"/>
+                        <text x="400" y="65" text-anchor="middle" font-size="11" fill="#a855f7" font-weight="600">NodeBatchIPC</text>
+                        <text x="400" y="80" text-anchor="middle" font-size="9" fill="#64748b">MP.Queue</text>
+                        
+                        <!-- Queues for each rank -->
+                        <rect x="365" y="95" width="70" height="55" fill="#0f1623" stroke="#3b82f6" rx="4"/>
+                        <text x="400" y="112" text-anchor="middle" font-size="9" fill="#3b82f6">Rank 0</text>
+                        <rect x="375" y="120" width="50" height="8" fill="#3b82f6" opacity="0.6" rx="1"/>
+                        <rect x="375" y="130" width="50" height="8" fill="#3b82f6" opacity="0.6" rx="1"/>
+                        <rect x="375" y="140" width="50" height="8" fill="#3b82f6" opacity="0.6" rx="1"/>
+                        
+                        <rect x="365" y="160" width="70" height="55" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <text x="400" y="177" text-anchor="middle" font-size="9" fill="#10b981">Rank 1</text>
+                        <rect x="375" y="185" width="50" height="8" fill="#10b981" opacity="0.6" rx="1"/>
+                        <rect x="375" y="195" width="50" height="8" fill="#10b981" opacity="0.6" rx="1"/>
+                        <rect x="375" y="205" width="50" height="8" fill="#10b981" opacity="0.6" rx="1"/>
+                        
+                        <rect x="365" y="225" width="70" height="55" fill="#0f1623" stroke="#f97316" rx="4"/>
+                        <text x="400" y="242" text-anchor="middle" font-size="9" fill="#f97316">Rank 2</text>
+                        <rect x="375" y="250" width="50" height="8" fill="#f97316" opacity="0.6" rx="1"/>
+                        <rect x="375" y="260" width="50" height="8" fill="#f97316" opacity="0.6" rx="1"/>
+                        <rect x="375" y="270" width="50" height="8" fill="#f97316" opacity="0.6" rx="1"/>
+                        
+                        <rect x="365" y="290" width="70" height="55" fill="#0f1623" stroke="#a855f7" rx="4"/>
+                        <text x="400" y="307" text-anchor="middle" font-size="9" fill="#a855f7">Rank 3</text>
+                        <rect x="375" y="315" width="50" height="8" fill="#a855f7" opacity="0.6" rx="1"/>
+                        <rect x="375" y="325" width="50" height="8" fill="#a855f7" opacity="0.6" rx="1"/>
+                        <rect x="375" y="335" width="50" height="8" fill="#a855f7" opacity="0.6" rx="1"/>
+                        
+                        <!-- Shared metrics -->
+                        <rect x="365" y="355" width="70" height="25" fill="#0f1623" stroke="#64748b" stroke-dasharray="2,2" rx="3"/>
+                        <text x="400" y="372" text-anchor="middle" font-size="8" fill="#64748b">metrics</text>
+                        
+                        <!-- Consumer Ranks -->
+                        <rect x="470" y="55" width="300" height="80" fill="#1a2332" stroke="#3b82f6" stroke-width="2" rx="6"/>
+                        <text x="620" y="75" text-anchor="middle" font-size="11" fill="#3b82f6" font-weight="600">Rank 0 - ConsumerCutSampler</text>
+                        <text x="620" y="95" text-anchor="middle" font-size="9" fill="#64748b">从 queue[0] 获取 batch</text>
+                        <text x="620" y="115" text-anchor="middle" font-size="10" fill="#10b981">50 cuts, 8.5s</text>
+                        
+                        <rect x="470" y="145" width="300" height="80" fill="#1a2332" stroke="#10b981" stroke-width="2" rx="6"/>
+                        <text x="620" y="165" text-anchor="middle" font-size="11" fill="#10b981" font-weight="600">Rank 1 - ConsumerCutSampler</text>
+                        <text x="620" y="185" text-anchor="middle" font-size="9" fill="#64748b">从 queue[1] 获取 batch</text>
+                        <text x="620" y="205" text-anchor="middle" font-size="10" fill="#10b981">50 cuts, 8.5s</text>
+                        
+                        <rect x="470" y="235" width="300" height="80" fill="#1a2332" stroke="#f97316" stroke-width="2" rx="6"/>
+                        <text x="620" y="255" text-anchor="middle" font-size="11" fill="#f97316" font-weight="600">Rank 2 - ConsumerCutSampler</text>
+                        <text x="620" y="275" text-anchor="middle" font-size="9" fill="#64748b">从 queue[2] 获取 batch</text>
+                        <text x="620" y="295" text-anchor="middle" font-size="10" fill="#10b981">50 cuts, 8.5s</text>
+                        
+                        <rect x="470" y="325" width="300" height="40" fill="#1a2332" stroke="#a855f7" stroke-width="2" rx="6"/>
+                        <text x="620" y="345" text-anchor="middle" font-size="11" fill="#a855f7" font-weight="600">Rank 3 - ConsumerCutSampler</text>
+                        <text x="620" y="360" text-anchor="middle" font-size="10" fill="#10b981">50 cuts, 8.5s</text>
+                        
+                        <!-- Arrows -->
+                        <path d="M 330 90 L 350 120" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)" opacity="0.6"/>
+                        <path d="M 330 110 L 350 190" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)" opacity="0.6"/>
+                        <path d="M 330 130 L 350 260" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)" opacity="0.6"/>
+                        <path d="M 330 150 L 350 325" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)" opacity="0.6"/>
+                        
+                        <path d="M 450 95 L 470 95" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)"/>
+                        <path d="M 450 187 L 470 185" stroke="#10b981" stroke-width="2" marker-end="url(#arrow)"/>
+                        <path d="M 450 277 L 470 275" stroke="#f97316" stroke-width="2" marker-end="url(#arrow)"/>
+                        <path d="M 450 345 L 470 345" stroke="#a855f7" stroke-width="2" marker-end="url(#arrow)"/>
+                        
+                        <!-- Success indicator -->
+                        <rect x="700" y="180" width="70" height="60" fill="#10b981" opacity="0.1" stroke="#10b981" rx="6"/>
+                        <text x="735" y="210" text-anchor="middle" font-size="24" fill="#10b981">✓</text>
+                        <text x="735" y="230" text-anchor="middle" font-size="9" fill="#10b981">均衡!</text>
+                    </svg>
+                </div>
+
+                <h3>核心组件</h3>
+
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: rgba(0, 212, 255, 0.1); border-color: rgba(0, 212, 255, 0.3);">🔄</div>
+                            <span>NodeBatchProducer</span>
+                        </div>
+                        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.75rem;">独立进程/线程中运行，负责统一采样和 Packing</p>
+                        <ul style="font-size: 0.85rem; color: var(--text-muted); padding-left: 1.2rem; margin: 0;">
+                            <li>使用 PackAwareSampler 采集 raw cuts</li>
+                            <li>CutConcatenate 拼接成 packed cuts</li>
+                            <li>均衡分配算法确保各 Rank 时长一致</li>
+                            <li>将 batch 放入 IPC 队列</li>
+                        </ul>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: rgba(168, 85, 247, 0.1); border-color: rgba(168, 85, 247, 0.3);">📥</div>
+                            <span>NodeBatchIPC</span>
+                        </div>
+                        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.75rem;">进程间通信的共享队列和同步机制</p>
+                        <ul style="font-size: 0.85rem; color: var(--text-muted); padding-left: 1.2rem; margin: 0;">
+                            <li><code>rank_queues</code>: 每个 Rank 的专属队列</li>
+                            <li><code>shared_metrics</code>: 跨进程指标共享</li>
+                            <li><code>stop_event</code>: 停止信号同步</li>
+                            <li><code>lock</code>: 队列操作锁</li>
+                        </ul>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-icon" style="background: rgba(16, 185, 129, 0.1); border-color: rgba(16, 185, 129, 0.3);">👤</div>
+                            <span>ConsumerCutSampler</span>
+                        </div>
+                        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.75rem;">各 Rank 的消费者，从队列获取数据</p>
+                        <ul style="font-size: 0.85rem; color: var(--text-muted); padding-left: 1.2rem; margin: 0;">
+                            <li>每个 Rank 一个实例</li>
+                            <li>从对应 queue 获取 batch</li>
+                            <li>支持 Batch Replay 机制</li>
+                            <li>实现 PyTorch Sampler 接口</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <h3>Pack-Aware 分割流程</h3>
+
+                <div class="diagram-container">
+                    <div class="diagram-title">图 7: 三步 Pack-Aware 批次生成与分配</div>
+                    <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+                            </marker>
+                        </defs>
+                        <rect x="0" y="0" width="800" height="280" fill="#0f1623" rx="8"/>
+                        
+                        <!-- Step 1: Sample -->
+                        <rect x="30" y="30" width="220" height="220" fill="#1a2332" stroke="#3b82f6" stroke-width="2" rx="8"/>
+                        <text x="140" y="55" text-anchor="middle" font-size="12" fill="#3b82f6" font-weight="600">Step 1: 采样</text>
+                        <text x="140" y="75" text-anchor="middle" font-size="10" fill="#64748b">PackAwareSampler</text>
+                        
+                        <text x="45" y="100" font-size="9" fill="#94a3b8">Raw Cuts Pool:</text>
+                        <rect x="45" y="110" width="30" height="15" fill="#3b82f6" rx="2"/>
+                        <rect x="80" y="110" width="45" height="15" fill="#10b981" rx="2"/>
+                        <rect x="130" y="110" width="25" height="15" fill="#f97316" rx="2"/>
+                        <rect x="160" y="110" width="35" height="15" fill="#a855f7" rx="2"/>
+                        <rect x="200" y="110" width="40" height="15" fill="#3b82f6" rx="2"/>
+                        
+                        <rect x="45" y="135" width="35" height="15" fill="#10b981" rx="2"/>
+                        <rect x="85" y="135" width="30" height="15" fill="#f97316" rx="2"/>
+                        <rect x="120" y="135" width="50" height="15" fill="#a855f7" rx="2"/>
+                        <rect x="175" y="135" width="28" height="15" fill="#3b82f6" rx="2"/>
+                        <rect x="208" y="135" width="32" height="15" fill="#10b981" rx="2"/>
+                        
+                        <text x="140" y="175" text-anchor="middle" font-size="9" fill="#64748b">采集 world_size 个</text>
+                        <text x="140" y="190" text-anchor="middle" font-size="9" fill="#64748b">raw batches</text>
+                        <text x="140" y="210" text-anchor="middle" font-size="11" fill="#3b82f6" font-weight="600">200 cuts × 4 Ranks</text>
+                        <text x="140" y="230" text-anchor="middle" font-size="9" fill="#64748b">总时长 ~6000s</text>
+                        
+                        <!-- Arrow -->
+                        <path d="M 260 140 L 290 140" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)"/>
+                        <text x="275" y="130" text-anchor="middle" font-size="9" fill="#00d4ff">concat</text>
+                        
+                        <!-- Step 2: Pack -->
+                        <rect x="300" y="30" width="220" height="220" fill="#1a2332" stroke="#f59e0b" stroke-width="2" rx="8"/>
+                        <text x="410" y="55" text-anchor="middle" font-size="12" fill="#f59e0b" font-weight="600">Step 2: 打包</text>
+                        <text x="410" y="75" text-anchor="middle" font-size="10" fill="#64748b">CutConcatenate</text>
+                        
+                        <text x="315" y="100" font-size="9" fill="#94a3b8">Packed Cuts:</text>
+                        <!-- Packed bins -->
+                        <rect x="315" y="110" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <rect x="320" y="115" width="35" height="12" fill="#3b82f6" rx="2"/>
+                        <rect x="358" y="115" width="25" height="12" fill="#10b981" rx="2"/>
+                        <rect x="320" y="130" width="28" height="12" fill="#f97316" rx="2"/>
+                        <rect x="352" y="130" width="38" height="12" fill="#a855f7" rx="2"/>
+                        
+                        <rect x="405" y="110" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <rect x="410" y="115" width="30" height="12" fill="#3b82f6" rx="2"/>
+                        <rect x="443" y="115" width="35" height="12" fill="#10b981" rx="2"/>
+                        <rect x="410" y="130" width="40" height="12" fill="#f97316" rx="2"/>
+                        <rect x="455" y="130" width="25" height="12" fill="#a855f7" rx="2"/>
+                        
+                        <rect x="315" y="155" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <rect x="405" y="155" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <rect x="315" y="200" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <rect x="405" y="200" width="80" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        
+                        <text x="410" y="200" text-anchor="middle" font-size="9" fill="#64748b">...</text>
+                        <text x="410" y="245" text-anchor="middle" font-size="11" fill="#f59e0b" font-weight="600">200 packed cuts</text>
+                        
+                        <!-- Arrow -->
+                        <path d="M 530 140 L 560 140" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)"/>
+                        <text x="545" y="130" text-anchor="middle" font-size="9" fill="#00d4ff">split</text>
+                        
+                        <!-- Step 3: Distribute -->
+                        <rect x="570" y="30" width="200" height="220" fill="#1a2332" stroke="#10b981" stroke-width="2" rx="8"/>
+                        <text x="670" y="55" text-anchor="middle" font-size="12" fill="#10b981" font-weight="600">Step 3: 均衡分割</text>
+                        <text x="670" y="75" text-anchor="middle" font-size="10" fill="#64748b">split_packed_cuts</text>
+                        
+                        <!-- Rank distributions -->
+                        <rect x="585" y="90" width="170" height="35" fill="#0f1623" stroke="#3b82f6" rx="4"/>
+                        <text x="595" y="105" font-size="9" fill="#3b82f6">Rank 0:</text>
+                        <text x="670" y="105" text-anchor="middle" font-size="10" fill="#f0f4f8">50 cuts, 1500s</text>
+                        <text x="670" y="118" text-anchor="middle" font-size="8" fill="#64748b">数量+时长均衡</text>
+                        
+                        <rect x="585" y="135" width="170" height="35" fill="#0f1623" stroke="#10b981" rx="4"/>
+                        <text x="595" y="150" font-size="9" fill="#10b981">Rank 1:</text>
+                        <text x="670" y="150" text-anchor="middle" font-size="10" fill="#f0f4f8">50 cuts, 1500s</text>
+                        <text x="670" y="163" text-anchor="middle" font-size="8" fill="#64748b">数量+时长均衡</text>
+                        
+                        <rect x="585" y="180" width="170" height="35" fill="#0f1623" stroke="#f97316" rx="4"/>
+                        <text x="595" y="195" font-size="9" fill="#f97316">Rank 2:</text>
+                        <text x="670" y="195" text-anchor="middle" font-size="10" fill="#f0f4f8">50 cuts, 1500s</text>
+                        <text x="670" y="208" text-anchor="middle" font-size="8" fill="#64748b">数量+时长均衡</text>
+                        
+                        <rect x="585" y="225" width="170" height="20" fill="#10b981" opacity="0.2" rx="3"/>
+                        <text x="670" y="238" text-anchor="middle" font-size="9" fill="#10b981">✓ 完全均衡 - 无 Bubble!</text>
+                    </svg>
+                </div>
+
+                <div class="alert alert-info">
+                    <strong>均衡策略：</strong>使用贪心算法，优先保证各 Rank 的 packed cuts 数量相同，然后按时长调整使得总时长尽可能均衡。
+                </div>
+
+                <h3>Batch Replay 机制</h3>
+
+                <div class="alert alert-info">
+                    <strong>核心概念：</strong>Batch Replay 是 ConsumerCutSampler 的三级容错机制中的第二层，当从队列获取 batch 超时（默认 500ms）时触发，通过复用历史 batch 避免训练中断。
+                </div>
+
+                <div class="diagram-container replay-tier-diagram-container">
+                    <div class="diagram-title replay-tier-caption">图 8: ConsumerCutSampler 三级容错机制</div>
+                    <div class="replay-tier-diagram-wrap">
+                        <svg class="replay-tier-diagram" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg">
+                      <defs>
+                        <!-- 渐变定义 -->
+                        <linearGradient id="card1-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                          <stop offset="0%" stop-color="#1e40af"/>
+                          <stop offset="100%" stop-color="#3b82f6"/>
+                        </linearGradient>
+                        <linearGradient id="card1-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+                          <stop offset="0%" stop-color="#1e3a8a" stop-opacity="0.3"/>
+                          <stop offset="100%" stop-color="#172554" stop-opacity="0.5"/>
+                        </linearGradient>
+                        
+                        <linearGradient id="card2-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                          <stop offset="0%" stop-color="#b45309"/>
+                          <stop offset="100%" stop-color="#f59e0b"/>
+                        </linearGradient>
+                        <linearGradient id="card2-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+                          <stop offset="0%" stop-color="#92400e" stop-opacity="0.3"/>
+                          <stop offset="100%" stop-color="#451a03" stop-opacity="0.5"/>
+                        </linearGradient>
+                        
+                        <linearGradient id="card3-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                          <stop offset="0%" stop-color="#991b1b"/>
+                          <stop offset="100%" stop-color="#ef4444"/>
+                        </linearGradient>
+                        <linearGradient id="card3-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+                          <stop offset="0%" stop-color="#7f1d1d" stop-opacity="0.3"/>
+                          <stop offset="100%" stop-color="#450a0a" stop-opacity="0.5"/>
+                        </linearGradient>
+                        
+                        <!-- Glow 滤镜 -->
+                        <filter id="glow-blue" x="-50%" y="-50%" width="200%" height="200%">
+                          <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                          <feMerge>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                          </feMerge>
+                        </filter>
+                        <filter id="glow-orange" x="-50%" y="-50%" width="200%" height="200%">
+                          <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+                          <feMerge>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                          </feMerge>
+                        </filter>
+                        <filter id="glow-red" x="-50%" y="-50%" width="200%" height="200%">
+                          <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                          <feMerge>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                          </feMerge>
+                        </filter>
+                        
+                        <!-- 箭头 marker -->
+                        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                          <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+                        </marker>
+                        <marker id="arrowhead-white" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                          <polygon points="0 0, 10 3.5, 0 7" fill="#f1f5f9"/>
+                        </marker>
+                        
+                        <!-- 勾选标记 -->
+                        <symbol id="checkmark" viewBox="0 0 20 20">
+                          <circle cx="10" cy="10" r="9" fill="none" stroke="#10b981" stroke-width="2"/>
+                          <path d="M6 10l3 3 5-6" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </symbol>
+                      </defs>
+                      
+                      <!-- 背景 -->
+                      <rect width="900" height="520" fill="#0f1623"/>
+                      
+                      <!-- 标题区域 -->
+                      <text x="450" y="35" text-anchor="middle" font-size="18" font-weight="bold" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+                        Batch Replay: 队列获取超时时的降级策略
+                      </text>
+                      <text x="450" y="58" text-anchor="middle" font-size="12" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+                        代码: consumer_sampler.py | 方法: _poll_next_item() → _maybe_make_replay_item()
+                      </text>
+                      
+                      <!-- ==================== 三层卡片区域 ==================== -->
+                      
+                      <!-- 第一层卡片: 队列缓冲 -->
+                      <g transform="translate(40, 80)">
+                        <!-- 卡片背景 -->
+                        <rect width="250" height="200" rx="12" fill="url(#card1-bg)" stroke="#3b82f6" stroke-width="2"/>
+                        
+                        <!-- 层数标签 -->
+                        <rect x="10" y="10" width="50" height="22" rx="11" fill="#3b82f6"/>
+                        <text x="35" y="26" text-anchor="middle" font-size="11" fill="white" font-weight="bold">第一层</text>
+                        
+                        <!-- 标题 -->
+                        <text x="125" y="32" text-anchor="middle" font-size="14" fill="#60a5fa" font-weight="bold">队列缓冲</text>
+                        
+                        <!-- 可视化: 队列图示 -->
+                        <g transform="translate(30, 55)">
+                          <!-- 队列容器 -->
+                          <rect x="0" y="20" width="190" height="50" rx="4" fill="#1e3a8a" stroke="#3b82f6" stroke-width="1.5"/>
+                          
+                          <!-- 队列中的元素 -->
+                          <rect x="10" y="28" width="35" height="34" rx="3" fill="#60a5fa" opacity="0.8"/>
+                          <rect x="50" y="28" width="35" height="34" rx="3" fill="#60a5fa" opacity="0.6"/>
+                          <rect x="90" y="28" width="35" height="34" rx="3" fill="#60a5fa" opacity="0.4"/>
+                          <rect x="130" y="28" width="25" height="34" rx="3" fill="#93c5fd" opacity="0.3" stroke="#60a5fa" stroke-dasharray="3,2"/>
+                          
+                          <!-- Producer 箭头 -->
+                          <path d="M 45 8 L 25 20" stroke="#10b981" stroke-width="2" fill="none" marker-end="url(#arrowhead-white)"/>
+                          <text x="55" y="12" font-size="9" fill="#34d399">Producer</text>
+                          
+                          <!-- Consumer 箭头 -->
+                          <path d="M 170 45 L 195 45" stroke="#f59e0b" stroke-width="2" fill="none" marker-end="url(#arrowhead-white)"/>
+                          <text x="165" y="62" font-size="9" fill="#fbbf24">Consumer</text>
+                          
+                          <!-- 缓冲指示 -->
+                          <text x="95" y="90" text-anchor="middle" font-size="10" fill="#93c5fd">queue_size per rank</text>
+                        </g>
+                        
+                        <!-- 说明文字 -->
+                        <text x="125" y="170" text-anchor="middle" font-size="10" fill="#bfdbfe">
+                          <tspan x="125" dy="0">正常消费路径</tspan>
+                          <tspan x="125" dy="14">block_on_empty 控制阻塞/非阻塞</tspan>
+                        </text>
+                      </g>
+                      
+                      <!-- 连接箭头 1 -->
+                      <g transform="translate(290, 160)">
+                        <line x1="0" y1="20" x2="50" y2="20" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+                        <text x="25" y="12" text-anchor="middle" font-size="9" fill="#94a3b8">获取超时</text>
+                      </g>
+                      
+                      <!-- 第二层卡片: Batch Replay (核心机制) -->
+                      <g transform="translate(340, 80)">
+                        <!-- 卡片背景 -->
+                        <rect width="250" height="200" rx="12" fill="url(#card2-bg)" stroke="#f59e0b" stroke-width="3" filter="url(#glow-orange)"/>
+                        
+                        <!-- 层数标签 -->
+                        <rect x="10" y="10" width="50" height="22" rx="11" fill="#f59e0b"/>
+                        <text x="35" y="26" text-anchor="middle" font-size="11" fill="#451a03" font-weight="bold">第二层</text>
+                        
+                        <!-- 标题 -->
+                        <text x="125" y="32" text-anchor="middle" font-size="14" fill="#fbbf24" font-weight="bold">Batch Replay</text>
+                        
+                        <!-- 可视化: 循环重放 -->
+                        <g transform="translate(35, 55)">
+                          <!-- 中心圆环 -->
+                          <circle cx="90" cy="45" r="38" fill="#451a03" stroke="#f59e0b" stroke-width="2"/>
+                          
+                          <!-- 旋转箭头 -->
+                          <path d="M 90 7 A 38 38 0 1 1 52 45" fill="none" stroke="#f59e0b" stroke-width="3" stroke-linecap="round"/>
+                          <polygon points="48,38 58,48 45,52" fill="#f59e0b"/>
+                          
+                          <!-- 中心文字 -->
+                          <text x="90" y="42" text-anchor="middle" font-size="10" fill="#fbbf24" font-weight="bold">REPLAY</text>
+                          <text x="90" y="55" text-anchor="middle" font-size="9" fill="#fcd34d">循环使用</text>
+                          
+                          <!-- 数据块环绕 -->
+                          <rect x="75" y="-5" width="30" height="18" rx="3" fill="#f59e0b" opacity="0.8"/>
+                          <text x="90" y="7" text-anchor="middle" font-size="8" fill="#451a03" font-weight="bold">batch</text>
+                          
+                          <!-- 重放次数指示 -->
+                          <text x="90" y="100" text-anchor="middle" font-size="10" fill="#fbbf24">_recent_batches 缓冲</text>
+                        </g>
+                        
+                        <!-- 说明文字 -->
+                        <text x="125" y="170" text-anchor="middle" font-size="10" fill="#fde68a">
+                          <tspan x="125" dy="0">队列获取超时时触发</tspan>
+                          <tspan x="125" dy="14">6项检查 + 频率控制</tspan>
+                        </text>
+                      </g>
+                      
+                      <!-- 连接箭头 2 -->
+                      <g transform="translate(590, 160)">
+                        <line x1="0" y1="20" x2="50" y2="20" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+                        <text x="25" y="12" text-anchor="middle" font-size="9" fill="#94a3b8">未触发</text>
+                      </g>
+                      
+                      <!-- 第三层卡片: 阻塞等待 -->
+                      <g transform="translate(640, 80)">
+                        <!-- 卡片背景 -->
+                        <rect width="220" height="200" rx="12" fill="url(#card3-bg)" stroke="#ef4444" stroke-width="2"/>
+                        
+                        <!-- 层数标签 -->
+                        <rect x="10" y="10" width="50" height="22" rx="11" fill="#ef4444"/>
+                        <text x="35" y="26" text-anchor="middle" font-size="11" fill="white" font-weight="bold">第三层</text>
+                        
+                        <!-- 标题 -->
+                        <text x="110" y="32" text-anchor="middle" font-size="14" fill="#f87171" font-weight="bold">阻塞等待</text>
+                        
+                        <!-- 可视化: 阻塞/暂停 -->
+                        <g transform="translate(35, 55)">
+                          <!-- 警告图标背景 -->
+                          <circle cx="75" cy="45" r="35" fill="#450a0a" stroke="#ef4444" stroke-width="2"/>
+                          
+                          <!-- 暂停符号 -->
+                          <rect x="58" y="28" width="12" height="34" rx="2" fill="#ef4444"/>
+                          <rect x="80" y="28" width="12" height="34" rx="2" fill="#ef4444"/>
+                          
+                          <!-- 警告光环 -->
+                          <circle cx="75" cy="45" r="42" fill="none" stroke="#ef4444" stroke-width="1" opacity="0.3" stroke-dasharray="4,4"/>
+                          
+                          <!-- 时钟指示 -->
+                          <text x="75" y="100" text-anchor="middle" font-size="10" fill="#fca5a5">block_timeout_sec</text>
+                        </g>
+                        
+                        <!-- 说明文字 -->
+                        <text x="110" y="170" text-anchor="middle" font-size="10" fill="#fecaca">
+                          <tspan x="110" dy="0">最终防线：阻塞等待</tspan>
+                          <tspan x="110" dy="14">或抛出 RuntimeError</tspan>
+                        </text>
+                      </g>
+                      
+                      <!-- ==================== 底部信息区域 ==================== -->
+                      
+                      <!-- 分隔线 -->
+                      <line x1="40" y1="305" x2="860" y2="305" stroke="#334155" stroke-width="1"/>
+                      
+                      <!-- Replay 触发条件区域 -->
+                      <g transform="translate(40, 325)">
+                        <!-- 标题 -->
+                        <text x="0" y="0" font-size="13" fill="#f1f5f9" font-weight="bold">Replay 触发条件</text>
+                        <text x="135" y="0" font-size="10" fill="#94a3b8">(需全部满足)</text>
+                        
+                        <!-- 条件框 -->
+                        <rect x="0" y="12" width="420" height="195" rx="8" fill="#1e293b" stroke="#64748b" stroke-width="1.5"/>
+                        
+                        <!-- 条件列表 -->
+                        <g transform="translate(15, 35)">
+                          <!-- 条件1 -->
+                          <use href="#checkmark" x="0" y="0" width="16" height="16"/>
+                          <text x="22" y="13" font-size="11" fill="#e2e8f0">功能开关: </text>
+                          <text x="85" y="13" font-size="11" fill="#fbbf24" font-family="monospace">replay_on_empty=True</text>
+                          
+                          <!-- 条件2 -->
+                          <use href="#checkmark" x="0" y="28" width="16" height="16"/>
+                          <text x="22" y="41" font-size="11" fill="#e2e8f0">等待超时: </text>
+                          <text x="85" y="41" font-size="11" fill="#fbbf24" font-family="monospace">waited_ms &gt;= 500ms</text>
+                          
+                          <!-- 条件3 -->
+                          <use href="#checkmark" x="0" y="56" width="16" height="16"/>
+                          <text x="22" y="69" font-size="11" fill="#e2e8f0">缓冲区非空: </text>
+                          <text x="100" y="69" font-size="11" fill="#fbbf24" font-family="monospace">_recent_batches</text>
+                          
+                          <!-- 条件4 -->
+                          <use href="#checkmark" x="0" y="84" width="16" height="16"/>
+                          <text x="22" y="97" font-size="11" fill="#e2e8f0">步数间隔: </text>
+                          <text x="85" y="97" font-size="11" fill="#fbbf24" font-family="monospace">&gt;= 100 steps</text>
+                          
+                          <!-- 条件5 -->
+                          <use href="#checkmark" x="0" y="112" width="16" height="16"/>
+                          <text x="22" y="125" font-size="11" fill="#e2e8f0">频率上限: </text>
+                          <text x="85" y="125" font-size="11" fill="#fbbf24" font-family="monospace">replay比例 &lt; 3%</text>
+                          
+                          <!-- 条件6 -->
+                          <use href="#checkmark" x="0" y="140" width="16" height="16"/>
+                          <text x="22" y="153" font-size="11" fill="#e2e8f0">随机概率: </text>
+                          <text x="85" y="153" font-size="11" fill="#fbbf24" font-family="monospace">&lt;= 25%</text>
+                        </g>
+                      </g>
+                      
+                      <!-- Replay 数据增强区域 -->
+                      <g transform="translate(480, 325)">
+                        <!-- 标题 -->
+                        <text x="0" y="0" font-size="13" fill="#f1f5f9" font-weight="bold">Replay 数据增强</text>
+                        <text x="125" y="0" font-size="10" fill="#94a3b8">(避免重复)</text>
+                        
+                        <!-- 增强框 -->
+                        <rect x="0" y="12" width="380" height="195" rx="8" fill="#1e293b" stroke="#10b981" stroke-width="1.5"/>
+                        
+                        <!-- shuffle_cuts -->
+                        <g transform="translate(20, 40)">
+                          <rect x="0" y="0" width="165" height="65" rx="6" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+                          <text x="82" y="18" text-anchor="middle" font-size="11" fill="#34d399" font-weight="bold" font-family="monospace">shuffle_cuts</text>
+                          <text x="82" y="38" text-anchor="middle" font-size="10" fill="#a7f3d0">对 batch 内的 packed cuts</text>
+                          <text x="82" y="54" text-anchor="middle" font-size="10" fill="#a7f3d0">打乱顺序</text>
+                        </g>
+                        
+                        <!-- shuffle_tracks -->
+                        <g transform="translate(195, 40)">
+                          <rect x="0" y="0" width="165" height="65" rx="6" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+                          <text x="82" y="18" text-anchor="middle" font-size="11" fill="#34d399" font-weight="bold" font-family="monospace">shuffle_tracks</text>
+                          <text x="82" y="38" text-anchor="middle" font-size="10" fill="#a7f3d0">对 MixedCut 内部</text>
+                          <text x="82" y="54" text-anchor="middle" font-size="10" fill="#a7f3d0">speech tracks 重排</text>
+                        </g>
+                        
+                        <!-- 效果说明 -->
+                        <g transform="translate(20, 115)">
+                          <text x="0" y="0" font-size="11" fill="#6ee7b7" font-weight="bold">增强效果:</text>
+                          <text x="0" y="18" font-size="10" fill="#d1fae5">• 随机重排 + 重新计算 offset</text>
+                          <text x="0" y="34" font-size="10" fill="#d1fae5">• 同一 batch replay 时呈现不同排列</text>
+                          <text x="0" y="50" font-size="10" fill="#d1fae5">• 生成新 MixedCut (带 replay 标记)</text>
+                        </g>
+                      </g>
+                      
+                      <!-- 底部说明 -->
+                      <text x="450" y="530" text-anchor="middle" font-size="10" fill="#64748b" font-style="italic">
+                        图8: ConsumerCutSampler 三级容错机制 - 代码: consumer_sampler.py
+                      </text>
+                        </svg>
+                    </div>
+                </div>
+
+                <div class="alert alert-warning">
+                    <strong>生产环境配置：</strong>正式训练时建议使用阻塞模式（<code>block_on_empty=True, block_timeout_sec=60</code>），确保数据流的确定性和可复现性。Batch Replay 机制（<code>replay_on_empty</code>）主要用于开发测试和验证阶段，或作为防止训练中断的保险措施。
+                </div>
+
+                <h3>配置参数</h3>
+
+                <h4>Node Producer 基础配置</h4>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>参数</th>
+                                <th>默认值</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>--use-node-producer</code></td>
+                                <td><span class="label label-green">False</span></td>
+                                <td>启用 Node Producer 集中采样架构</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-max-pending-batches</code></td>
+                                <td><code>4</code></td>
+                                <td>Producer 每个 Rank 队列最大缓存 batch 数量</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-num-workers</code></td>
+                                <td><code>4</code></td>
+                                <td>Producer 内部 DataLoader 的 worker 数量</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h4>IPC 配置</h4>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>参数</th>
+                                <th>默认值</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>--node-producer-queue-maxsize</code></td>
+                                <td><code>0</code></td>
+                                <td>单个 Rank 队列最大容量 (0=无限)</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-lock-timeout</code></td>
+                                <td><code>300.0</code></td>
+                                <td>队列锁超时时间 (秒)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h4>Consumer 配置</h4>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>参数</th>
+                                <th>代码变量</th>
+                                <th>默认值</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>--node-producer-block-on-empty</code></td>
+                                <td><code>block_on_empty</code></td>
+                                <td><span class="label label-green">True</span></td>
+                                <td>队列为空时是否阻塞等待</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-timeout</code></td>
+                                <td><code>block_timeout_sec</code></td>
+                                <td><code>0.0</code></td>
+                                <td>阻塞等待超时时间（秒，0=无限等待）</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h4>Batch Replay 配置</h4>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>参数</th>
+                                <th>代码变量</th>
+                                <th>默认值</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>--node-producer-replay</code></td>
+                                <td><code>replay_on_empty</code></td>
+                                <td><span class="label label-red">False</span></td>
+                                <td>是否启用 Batch Replay 功能</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-replay-wait-threshold-ms</code></td>
+                                <td><code>replay_wait_threshold_ms</code></td>
+                                <td><code>500.0</code></td>
+                                <td>触发 replay 的等待时间阈值（毫秒）</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-replay-buffer-size</code></td>
+                                <td><code>replay_buffer_size</code></td>
+                                <td><code>8</code></td>
+                                <td>历史 batch 缓存大小（_recent_batches）</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-replay-prob</code></td>
+                                <td><code>replay_prob</code></td>
+                                <td><code>0.25</code></td>
+                                <td>Replay 触发概率（25%）</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-replay-min-interval-steps</code></td>
+                                <td><code>replay_min_interval_steps</code></td>
+                                <td><code>100</code></td>
+                                <td>相邻 replay 的最小步数间隔</td>
+                            </tr>
+                            <tr>
+                                <td><code>--node-producer-replay-max-ratio</code></td>
+                                <td><code>replay_max_ratio</code></td>
+                                <td><code>0.03</code></td>
+                                <td>Replay 占总 batch 的最大比例（3%）</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3>监控指标</h3>
+
+                <pre class="code-block"><span class="comment"># Node Producer 监控指标示例 (shared_metrics)</span>
+{
+    <span class="string">"training_step"</span>: <span class="number">1523</span>,
+    <span class="string">"rank0_qsize"</span>: <span class="number">4</span>,           <span class="comment"># Rank 0 队列长度</span>
+    <span class="string">"rank1_qsize"</span>: <span class="number">3</span>,           <span class="comment"># Rank 1 队列长度</span>
+    <span class="string">"rank2_qsize"</span>: <span class="number">4</span>,           <span class="comment"># Rank 2 队列长度</span>
+    <span class="string">"rank3_qsize"</span>: <span class="number">4</span>,           <span class="comment"># Rank 3 队列长度</span>
+    <span class="string">"batches_produced"</span>: <span class="number">6120</span>,   <span class="comment"># Producer 生成的总 batch 数</span>
+    <span class="string">"batches_consumed"</span>: <span class="number">6092</span>,   <span class="comment"># Consumer 消费的总 batch 数</span>
+    <span class="string">"replay_count"</span>: <span class="number">12</span>,         <span class="comment"># Replay 触发次数</span>
+    <span class="string">"last_batch_time"</span>: <span class="number">1703123456.789</span>,
+    <span class="string">"is_producer_alive"</span>: <span class="keyword">true</span>
+}</pre>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon">📊</div>
+                        <span>关键观察指标</span>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem;">
+                        <div>
+                            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.5rem;"><strong>队列长度差异</strong></p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">各 Rank 队列长度应保持在 max_pending_batches 附近。如果某个 Rank 队列持续为空，说明该 Rank 消费过快。</p>
+                        </div>
+                        <div>
+                            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.5rem;"><strong>Replay 频率</strong></p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">replay_count / batches_consumed 应该 < 1%。如果过高，说明 Producer 速度不足或配置不均衡。</p>
+                        </div>
+                        <div>
+                            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.5rem;"><strong>Producer 生存状态</strong></p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">is_producer_alive 应始终为 true。如果变为 false，说明 Producer 进程崩溃，需要重启训练。</p>
+                        </div>
+                        <div>
+                            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 0.5rem;"><strong>Batch 时间戳</strong></p>
+                            <p style="font-size: 0.85rem; color: var(--text-muted);">last_batch_time 应持续更新。如果停止更新，说明 Producer 可能陷入死锁或数据耗尽。</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <!-- Parameters -->
             <section class="section" id="params">
                 <div class="section-header">
-                    <span class="section-number">07</span>
+                    <span class="section-number">09</span>
                     <h2>关键参数配置</h2>
                 </div>
 
@@ -1321,8 +2206,7 @@
                     </table>
                 </div>
 
-                <div class="code-block">
-<span class="comment"># 推荐配置 (run_french_150M.sh)</span>
+                <pre class="code-block"><span class="comment"># 推荐配置 (run_french_150M.sh)</span>
 <span class="comment"># ============ Packing 配置 ============</span>
 --packing-method knapsack                           <span class="comment"># 推荐: knapsack 模式</span>
 --max-duration <span class="number">1500</span>                                <span class="comment"># 每 rank 时长上限</span>
@@ -1337,7 +2221,7 @@
 
 <span class="comment"># ============ 数据加载配置 ============</span>
 --num-workers <span class="number">16</span>                                  <span class="comment"># DataLoader workers</span>
---prefetch-factor <span class="number">16</span>                              <span class="comment"># 预取因子</span></div>
+--prefetch-factor <span class="number">16</span>                              <span class="comment"># 预取因子</span></pre>
             </section>
         </main>
     </div>
