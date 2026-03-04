@@ -3209,10 +3209,23 @@ def run(
 
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
         # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
+        # saved in the middle of an epoch.
         sampler_state_dict = checkpoints["sampler"]
     else:
         sampler_state_dict = None
+
+    # In node-producer mode, rank0 restores a PackAware sampler.
+    # Checkpoints saved from consumer-side sampler state are incompatible
+    # (e.g. ConsumerCutSampler has no "inner"). Ignore them explicitly.
+    if node_data_enabled and sampler_state_dict is not None:
+        sampler_type = str(sampler_state_dict.get("sampler_type", ""))
+        if sampler_type != "PackAwareDistributedDynamicBucketingSampler":
+            logging.warning(
+                "Ignoring incompatible sampler state in node-producer mode: "
+                "sampler_type=%s (expected PackAwareDistributedDynamicBucketingSampler)",
+                sampler_type or "<missing>",
+            )
+            sampler_state_dict = None
 
     if node_data_enabled:
         metrics_out = str(getattr(params, "node_data_producer_metrics_out", "")).strip()
