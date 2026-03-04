@@ -2193,6 +2193,7 @@ def train_one_epoch(
     )
     rank_phase_topk_records: List[Dict[str, Any]] = []
     skipped_train_audio_batches = 0
+    skipped_train_audio_batches_peer = 0
     if rank_phase_profile_enabled and rank == 0:
         logging.info(
             "Rank phase profiling enabled: interval=%s topk=%s out=%s sync=%s",
@@ -2221,18 +2222,46 @@ def train_one_epoch(
         data_time = iter_start - prev_step_end
         compute_start = iter_start
 
-        if batch is None:
-            skipped_train_audio_batches += 1
-            if (
-                skipped_train_audio_batches <= 20
-                or skipped_train_audio_batches % 100 == 0
-            ):
-                logging.warning(
-                    "Skipping training batch due to unreadable audio "
-                    "(count=%s, local_batch=%s).",
-                    skipped_train_audio_batches,
-                    batch_idx,
-                )
+        local_batch_valid = 0 if batch is None else 1
+        global_batch_valid = local_batch_valid
+        if world_size > 1 and dist.is_initialized():
+            backend = dist.get_backend()
+            reduce_dev = (
+                model_device
+                if (torch.cuda.is_available() and backend == "nccl")
+                else torch.device("cpu")
+            )
+            valid_t = torch.tensor(
+                [local_batch_valid], dtype=torch.int32, device=reduce_dev
+            )
+            dist.all_reduce(valid_t, op=dist.ReduceOp.MIN)
+            global_batch_valid = int(valid_t.item())
+
+        if global_batch_valid == 0:
+            if local_batch_valid == 0:
+                skipped_train_audio_batches += 1
+                if (
+                    skipped_train_audio_batches <= 20
+                    or skipped_train_audio_batches % 100 == 0
+                ):
+                    logging.warning(
+                        "Skipping training step due to local unreadable audio "
+                        "(local_count=%s, local_batch=%s).",
+                        skipped_train_audio_batches,
+                        batch_idx,
+                    )
+            else:
+                skipped_train_audio_batches_peer += 1
+                if (
+                    skipped_train_audio_batches_peer <= 20
+                    or skipped_train_audio_batches_peer % 100 == 0
+                ):
+                    logging.warning(
+                        "Skipping training step due to peer rank unreadable audio "
+                        "(peer_count=%s, local_batch=%s).",
+                        skipped_train_audio_batches_peer,
+                        batch_idx,
+                    )
             prev_step_end = time.perf_counter()
             continue
 
