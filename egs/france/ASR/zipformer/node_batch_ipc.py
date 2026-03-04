@@ -44,6 +44,7 @@ def create_node_batch_ipc(
         metrics[f"consumed_step_rank{r}"] = -1
         metrics[f"consumer_wait_ms_rank{r}"] = 0.0
         metrics[f"consumer_replay_count_rank{r}"] = 0
+        metrics[f"consumer_stale_drop_count_rank{r}"] = 0
 
     ipc = NodeBatchIPC(
         world_size=int(world_size),

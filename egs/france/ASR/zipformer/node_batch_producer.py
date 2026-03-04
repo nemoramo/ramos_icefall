@@ -88,6 +88,10 @@ class NodeBatchProducer:
             int(self.ipc.metrics.get(f"consumer_replay_count_rank{r}", 0))
             for r in range(int(self.ipc.world_size))
         ]
+        stale_drops = [
+            int(self.ipc.metrics.get(f"consumer_stale_drop_count_rank{r}", 0))
+            for r in range(int(self.ipc.world_size))
+        ]
 
         valid = [x for x in consumed if x >= 0]
         lag_steps = (max(valid) - min(valid)) if valid else 0
@@ -112,6 +116,7 @@ class NodeBatchProducer:
             "consumed_step_per_rank": consumed,
             "consumer_wait_ms_per_rank": waits,
             "consumer_replay_count_per_rank": replays,
+            "consumer_stale_drop_count_per_rank": stale_drops,
             "lag_steps": int(lag_steps),
         }
 

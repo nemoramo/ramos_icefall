@@ -59,11 +59,19 @@ class ConsumerCutSampler(CutSampler):
         self.replay_max_ratio = min(max(float(replay_max_ratio), 0.0), 1.0)
         self._replay_count = 0
         self._last_replay_consumed_step = -10**9
+        self._last_yielded_step_id = int(
+            self.ipc.metrics.get(f"consumed_step_rank{int(self.rank)}", -1)
+        )
+        self._stale_drop_count = 0
 
     def __iter__(self) -> "ConsumerCutSampler":
         self._consumed_in_epoch = 0
         self._replay_count = 0
         self._last_replay_consumed_step = -10**9
+        self._last_yielded_step_id = int(
+            self.ipc.metrics.get(f"consumed_step_rank{int(self.rank)}", -1)
+        )
+        self._stale_drop_count = 0
         return self
 
     def set_epoch(self, epoch: int) -> None:
@@ -71,6 +79,10 @@ class ConsumerCutSampler(CutSampler):
         self._consumed_in_epoch = 0
         self._replay_count = 0
         self._last_replay_consumed_step = -10**9
+        self._last_yielded_step_id = int(
+            self.ipc.metrics.get(f"consumed_step_rank{int(self.rank)}", -1)
+        )
+        self._stale_drop_count = 0
         # Keep recent batch cache across epochs: it enables bootstrap replay
         # if a queue is temporarily empty right after epoch start.
 
@@ -81,6 +93,8 @@ class ConsumerCutSampler(CutSampler):
                 "sampler_type": "ConsumerCutSampler",
                 "consumed_in_epoch": int(self._consumed_in_epoch),
                 "replay_count": int(self._replay_count),
+                "last_yielded_step_id": int(self._last_yielded_step_id),
+                "stale_drop_count": int(self._stale_drop_count),
             }
         )
         return sd
@@ -89,6 +103,13 @@ class ConsumerCutSampler(CutSampler):
         sd.pop("sampler_type", None)
         self._consumed_in_epoch = int(sd.pop("consumed_in_epoch", 0))
         self._replay_count = int(sd.pop("replay_count", 0))
+        self._last_yielded_step_id = int(
+            sd.pop(
+                "last_yielded_step_id",
+                self.ipc.metrics.get(f"consumed_step_rank{int(self.rank)}", -1),
+            )
+        )
+        self._stale_drop_count = int(sd.pop("stale_drop_count", 0))
         super().load_state_dict(sd)
 
     def _maybe_make_replay_item(self, waited_ms: float) -> Optional[Dict[str, Any]]:
@@ -97,6 +118,12 @@ class ConsumerCutSampler(CutSampler):
         if waited_ms < self.replay_wait_threshold_ms:
             return None
         if not self._recent_batches:
+            return None
+        next_expected_step_id = int(self._last_yielded_step_id) + 1
+        # Replay can only substitute a step that has already been produced.
+        # This prevents creating a phantom extra optimization step.
+        last_produced_step_id = int(self.ipc.metrics.get("last_step_id", -1))
+        if last_produced_step_id < next_expected_step_id:
             return None
         # Hard cap replay frequency:
         # 1) absolute spacing by steps
@@ -117,7 +144,7 @@ class ConsumerCutSampler(CutSampler):
         return {
             "type": "replay_batch",
             "epoch": int(self.epoch),
-            "step_id": int(self.ipc.metrics.get(f"consumed_step_rank{int(self.rank)}", -1)),
+            "step_id": int(next_expected_step_id),
             "cuts": replay_cuts,
         }
 
@@ -243,6 +270,15 @@ class ConsumerCutSampler(CutSampler):
             if typ == "epoch_end":
                 raise StopIteration
             if typ == "batch":
+                step_id = int(item.get("step_id", -1))
+                if step_id <= int(self._last_yielded_step_id):
+                    # A replay has already substituted this step. Drop stale
+                    # real batch so all ranks keep the same step count/order.
+                    self._stale_drop_count += 1
+                    self.ipc.metrics[f"consumer_stale_drop_count_rank{int(self.rank)}"] = int(
+                        self._stale_drop_count
+                    )
+                    continue
                 break
             if typ == "replay_batch":
                 break
@@ -260,6 +296,7 @@ class ConsumerCutSampler(CutSampler):
         self._consumed_in_epoch += 1
         step_id = int(item.get("step_id", -1))
         self.ipc.metrics[f"consumed_step_rank{int(self.rank)}"] = step_id
+        self._last_yielded_step_id = step_id
 
         selected = cuts
         if isinstance(selected, CutSet):
