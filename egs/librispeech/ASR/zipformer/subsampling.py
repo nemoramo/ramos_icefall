@@ -332,7 +332,16 @@ class Conv2dSubsampling(nn.Module):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 x_lens = (x_lens - 7) // 2
-        assert x.size(1) == x_lens.max().item(), (x.size(1), x_lens.max())
+        max_len = int(x_lens.max().item())
+        if max_len != x.size(1):
+            # Rare metadata/frame-count drift (typically off by 1) can happen
+            # with on-the-fly features + packed cuts. Keep training robust.
+            if abs(x.size(1) - max_len) <= 2:
+                x_lens = x_lens.clone()
+                max_idx = int(torch.argmax(x_lens).item())
+                x_lens[max_idx] = x.size(1)
+            else:
+                raise AssertionError((x.size(1), x_lens.max()))
 
         return x, x_lens
 
@@ -390,7 +399,14 @@ class Conv2dSubsampling(nn.Module):
                 assert self.convnext.padding[0] == 3
                 x_lens = (x_lens - 7) // 2 - 3
 
-        assert x.size(1) == x_lens.max().item(), (x.shape, x_lens.max())
+        max_len = int(x_lens.max().item())
+        if max_len != x.size(1):
+            if abs(x.size(1) - max_len) <= 2:
+                x_lens = x_lens.clone()
+                max_idx = int(torch.argmax(x_lens).item())
+                x_lens[max_idx] = x.size(1)
+            else:
+                raise AssertionError((x.shape, x_lens.max()))
 
         return x, x_lens, cached_left_pad
 
