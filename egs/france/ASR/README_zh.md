@@ -9,6 +9,11 @@
 - 训练入口: `egs/france/ASR/run_french_150M.sh`
 - 训练主程序: `egs/france/ASR/zipformer/train.py`
 
+## 相关文档
+
+- Packing 训练: `egs/france/ASR/PACKING_TRAINING.md`
+- 混合读取（feature + wav）: `egs/france/ASR/MIXED_INPUT.md`
+
 ## 数据约定
 
 `run_french_150M.sh` 默认期望以下文件：

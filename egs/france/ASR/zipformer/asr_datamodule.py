@@ -46,6 +46,7 @@ from torch.utils.data import DataLoader, Dataset
 from icefall.utils import str2bool
 
 from consumer_sampler import ConsumerCutSampler
+from mixed_input_strategy import MixedCutInputStrategy
 from pack_ddp_sampler import PackAwareDistributedDynamicBucketingSampler
 
 
@@ -592,6 +593,33 @@ class MSR_AsrDataModule:
             help="AudioSamples or PrecomputedFeatures",
         )
         group.add_argument(
+            "--mixed-input-enabled",
+            type=str2bool,
+            default=False,
+            help=(
+                "If True, allow one batch to contain both feature cuts and wav cuts. "
+                "Feature cuts use PrecomputedFeatures; wav cuts use OnTheFlyFeatures."
+            ),
+        )
+        group.add_argument(
+            "--mixed-input-type-key",
+            type=str,
+            default="input_type",
+            help=(
+                "cut.custom key used to identify mixed input type "
+                "(feature/wav)."
+            ),
+        )
+        group.add_argument(
+            "--mixed-input-feature-local-only",
+            type=str2bool,
+            default=True,
+            help=(
+                "If True, mixed precomputed feature cuts only allow local "
+                "storage paths (reject URI-like storage_path)."
+            ),
+        )
+        group.add_argument(
             "--train-cuts-filename",
             type=str,
             default="msr_cuts_French_train.jsonl.gz",
@@ -904,14 +932,23 @@ class MSR_AsrDataModule:
             logging.info("Disable SpecAugment")
 
         logging.info("About to create train dataset")
-        train = K2SpeechRecognitionDataset(
-            input_strategy=eval(self.args.input_strategy)(),
-            cut_transforms=transforms,
-            input_transforms=input_transforms,
-            return_cuts=self.args.return_cuts,
-        )
-
-        if self.args.on_the_fly_feats:
+        if bool(getattr(self.args, "mixed_input_enabled", False)):
+            if not bool(self.args.on_the_fly_feats):
+                logging.warning(
+                    "mixed_input_enabled=True overrides --on-the-fly-feats=False "
+                    "for wav cuts in mixed batches."
+                )
+            train_input_strategy = MixedCutInputStrategy(
+                precomputed=PrecomputedFeatures(),
+                on_the_fly=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
+                input_type_key=str(
+                    getattr(self.args, "mixed_input_type_key", "input_type")
+                ),
+                feature_local_only=bool(
+                    getattr(self.args, "mixed_input_feature_local_only", True)
+                ),
+            )
+        elif self.args.on_the_fly_feats:
             # NOTE: the PerturbSpeed transform should be added only if we
             # remove it from data prep stage.
             # Add on-the-fly speed perturbation; since originally it would
@@ -922,12 +959,16 @@ class MSR_AsrDataModule:
             # to be strict (e.g. could be randomized)
             # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
             # Drop feats to be on the safe side.
-            train = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
-                input_transforms=input_transforms,
-                return_cuts=self.args.return_cuts,
-            )
+            train_input_strategy = OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
+        else:
+            train_input_strategy = eval(self.args.input_strategy)()
+
+        train = K2SpeechRecognitionDataset(
+            input_strategy=train_input_strategy,
+            cut_transforms=transforms,
+            input_transforms=input_transforms,
+            return_cuts=self.args.return_cuts,
+        )
         train = _FaultTolerantSpeechDataset(
             train,
             split="train",
