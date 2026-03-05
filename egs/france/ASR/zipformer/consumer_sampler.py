@@ -249,6 +249,35 @@ class ConsumerCutSampler(CutSampler):
                         self._replay_count + 1
                     )
                     return replay_item
+                # Epoch-end deadlock guard:
+                # If the producer has already marked this epoch as done and we
+                # have consumed all produced steps, but we still don't receive
+                # an explicit "epoch_end" control message, synthesize it to
+                # avoid infinite blocking.
+                try:
+                    done_epoch = int(self.ipc.metrics.get("epoch_done", -1))
+                    done_step_id = int(self.ipc.metrics.get("epoch_done_step_id", -1))
+                except Exception:
+                    done_epoch = -1
+                    done_step_id = -1
+                if (
+                    done_epoch == int(self.epoch)
+                    and done_step_id >= 0
+                    and int(self._last_yielded_step_id) >= int(done_step_id)
+                    and waited >= 5.0
+                ):
+                    # Count synthetic epoch ends for debugging.
+                    try:
+                        key = f"consumer_synth_epoch_end_count_rank{int(self.rank)}"
+                        self.ipc.metrics[key] = int(self.ipc.metrics.get(key, 0)) + 1
+                    except Exception:
+                        pass
+                    return {
+                        "type": "epoch_end",
+                        "epoch": int(self.epoch),
+                        "step_id": int(done_step_id),
+                        "synthetic": True,
+                    }
                 if not self.block_on_empty:
                     if self.block_timeout_sec <= 0 or waited >= self.block_timeout_sec:
                         return None

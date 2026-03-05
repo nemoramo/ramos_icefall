@@ -46,6 +46,13 @@ class NodeBatchProducer:
             return
         self._started = True
         self.ipc.metrics["producer_alive"] = 1
+        # Init handshake fields (best-effort; may already exist).
+        if "epoch_done" not in self.ipc.metrics:
+            self.ipc.metrics["epoch_done"] = -1
+        if "epoch_done_step_id" not in self.ipc.metrics:
+            self.ipc.metrics["epoch_done_step_id"] = -1
+        if "epoch_done_ts" not in self.ipc.metrics:
+            self.ipc.metrics["epoch_done_ts"] = 0.0
         self._thread = threading.Thread(
             target=self._run,
             name="node-batch-producer",
@@ -107,6 +114,9 @@ class NodeBatchProducer:
             "event": event,
             "epoch": int(epoch),
             "active_epoch": int(self.ipc.metrics.get("active_epoch", -1)),
+            "epoch_done": int(self.ipc.metrics.get("epoch_done", -1)),
+            "epoch_done_step_id": int(self.ipc.metrics.get("epoch_done_step_id", -1)),
+            "epoch_done_ts": float(self.ipc.metrics.get("epoch_done_ts", 0.0)),
             "producer_alive": int(self.ipc.metrics.get("producer_alive", 0)),
             "produced_steps_total": produced_total,
             "produced_steps_epoch": int(self.ipc.metrics.get("produced_steps_epoch", 0)),
@@ -199,6 +209,11 @@ class NodeBatchProducer:
             ok = self._put_blocking(r, end_item)
             if not ok:
                 break
+        # Epoch completion handshake for consumers: even if a control message is
+        # lost, consumers can exit once they have consumed up to done_step_id.
+        self.ipc.metrics["epoch_done"] = int(epoch)
+        self.ipc.metrics["epoch_done_step_id"] = int(self._step_id)
+        self.ipc.metrics["epoch_done_ts"] = float(time.time())
         self._append_metrics(self._collect_metrics(event="epoch_end", epoch=epoch))
 
     def _run(self) -> None:
