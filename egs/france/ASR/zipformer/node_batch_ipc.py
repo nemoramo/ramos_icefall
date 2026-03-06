@@ -35,6 +35,9 @@ def create_node_batch_ipc(
     now = float(time.time())
     metrics["created_at"] = now
     metrics["active_epoch"] = -1
+    metrics["requested_epoch"] = -1
+    metrics["produced_epoch"] = -1
+    metrics["next_epoch_to_run"] = -1
     # Producer epoch completion handshake.
     # Consumers can use these to avoid infinite blocking if an epoch_end
     # control message is lost due to IPC issues.

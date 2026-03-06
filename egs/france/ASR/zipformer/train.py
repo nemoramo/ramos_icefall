@@ -3275,12 +3275,17 @@ def run(
                 heartbeat_sec=float(
                     getattr(params, "node_data_producer_heartbeat_sec", 2)
                 ),
+                max_epoch=int(params.num_epochs - 1),
+                prefetch_next_epoch=bool(
+                    getattr(params, "node_data_producer_prefetch_next_epoch", True)
+                ),
             )
             node_producer.start()
             logging.info(
-                "Node data producer started: metrics_out=%s queue_size=%s",
+                "Node data producer started: metrics_out=%s queue_size=%s prefetch_next_epoch=%s",
                 metrics_out,
                 int(getattr(params, "node_data_producer_queue_size", 32)),
+                bool(getattr(params, "node_data_producer_prefetch_next_epoch", True)),
             )
 
         train_dl = msr.train_dataloaders(
@@ -3383,7 +3388,7 @@ def run(
     finally:
         if node_data_enabled and rank == 0 and node_producer is not None:
             logging.info("Stopping node data producer.")
-            node_producer.stop(set_stop_event=False)
+            node_producer.stop(set_stop_event=True)
 
     logging.info("Done!")
 

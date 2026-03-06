@@ -703,6 +703,15 @@ class MSR_AsrDataModule:
             help="Heartbeat cadence (seconds) for producer-side metrics updates.",
         )
         group.add_argument(
+            "--node-data-producer-prefetch-next-epoch",
+            type=str2bool,
+            default=True,
+            help=(
+                "If True, let the node producer start filling the next epoch "
+                "behind the current epoch_end sentinel to reduce epoch-boundary stalls."
+            ),
+        )
+        group.add_argument(
             "--node-data-producer-replay-on-empty",
             type=str2bool,
             default=False,
