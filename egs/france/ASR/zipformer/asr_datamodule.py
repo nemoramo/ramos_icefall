@@ -96,10 +96,24 @@ class _FaultTolerantSpeechDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, item):
+        node_batch_meta = None
+        if isinstance(item, dict) and "__node_control__" in item:
+            return dict(item)
+        if isinstance(item, dict) and "cuts" in item:
+            node_batch_meta = item.get("node_batch_meta", None)
+            item = item["cuts"]
         if not self.enabled:
-            return self.dataset[item]
+            ans = self.dataset[item]
+            if node_batch_meta is not None and isinstance(ans, dict):
+                ans = dict(ans)
+                ans["node_batch_meta"] = dict(node_batch_meta)
+            return ans
         try:
-            return self.dataset[item]
+            ans = self.dataset[item]
+            if node_batch_meta is not None and isinstance(ans, dict):
+                ans = dict(ans)
+                ans["node_batch_meta"] = dict(node_batch_meta)
+            return ans
         except Exception as ex:
             if not _is_readable_audio_error(ex):
                 raise
@@ -116,6 +130,11 @@ class _FaultTolerantSpeechDataset(Dataset):
                     self._skipped,
                     repr(ex),
                 )
+            if node_batch_meta is not None:
+                return {
+                    "__skip_batch__": True,
+                    "node_batch_meta": dict(node_batch_meta),
+                }
             return None
 
 
@@ -712,6 +731,15 @@ class MSR_AsrDataModule:
             ),
         )
         group.add_argument(
+            "--node-data-producer-continuous-stream",
+            type=str2bool,
+            default=True,
+            help=(
+                "If True, keep the consumer-side DataLoader iterator alive across "
+                "logical epoch boundaries and let train.py handle epoch bookkeeping."
+            ),
+        )
+        group.add_argument(
             "--node-data-producer-replay-on-empty",
             type=str2bool,
             default=False,
@@ -1003,6 +1031,13 @@ class MSR_AsrDataModule:
                     ),
                     replay_max_ratio=float(
                         getattr(self.args, "node_data_producer_replay_max_ratio", 0.03)
+                    ),
+                    continuous_stream=bool(
+                        getattr(
+                            self.args,
+                            "node_data_producer_continuous_stream",
+                            True,
+                        )
                     ),
                 )
             elif use_ddp_pack_sampler:

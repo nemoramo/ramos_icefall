@@ -63,7 +63,7 @@ import warnings
 from collections import deque
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import k2
 import optim
@@ -209,6 +209,8 @@ def _move_batch_inputs_to_device(
 ) -> Dict[str, Any]:
     if not isinstance(batch, dict):
         return batch
+    if bool(batch.get("__skip_batch__", False)):
+        return batch
     feature = batch.get("inputs", None)
     if not torch.is_tensor(feature):
         return batch
@@ -238,10 +240,11 @@ def _iter_with_feature_prefetch(
     batch_iter = iter(loader)
     queue = deque()
     exhausted = False
+    control_barrier_pending = False
 
     def _enqueue_one() -> None:
-        nonlocal exhausted
-        if exhausted:
+        nonlocal exhausted, control_barrier_pending
+        if exhausted or control_barrier_pending:
             return
         try:
             batch = next(batch_iter)
@@ -251,18 +254,112 @@ def _iter_with_feature_prefetch(
         with torch.cuda.stream(stream):
             batch = _move_batch_inputs_to_device(batch, device=device)
         queue.append(batch)
+        if isinstance(batch, dict) and "__node_control__" in batch:
+            # Do not prefetch across an explicit logical-epoch boundary.
+            # The next batch may not exist until train.py handles the control
+            # item and requests the next epoch from the node producer.
+            control_barrier_pending = True
 
     for _ in range(prefetch_batches):
         _enqueue_one()
-        if exhausted:
+        if exhausted or control_barrier_pending:
             break
 
     cur_stream = torch.cuda.current_stream(device=device)
     while queue:
         cur_stream.wait_stream(stream)
         batch = queue.popleft()
-        _enqueue_one()
         yield batch
+        if isinstance(batch, dict) and "__node_control__" in batch:
+            control_barrier_pending = False
+        _enqueue_one()
+
+
+def _create_train_iter(
+    *,
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    train_dl: torch.utils.data.DataLoader,
+    rank: int,
+) -> Iterator[dict]:
+    model_device = next(model.parameters()).device
+    feature_prefetch_batches = max(
+        0, int(getattr(params, "feature_prefetch_batches", 0))
+    )
+    if rank == 0:
+        logging.info(
+            "Feature prefetch: batches=%s (device=%s)",
+            feature_prefetch_batches,
+            model_device,
+        )
+    return _iter_with_feature_prefetch(
+        train_dl,
+        device=model_device,
+        num_prefetch_batches=feature_prefetch_batches,
+    )
+
+
+def _extract_node_batch_meta(batch: Optional[dict]) -> Optional[Dict[str, Any]]:
+    if not isinstance(batch, dict):
+        return None
+    try:
+        meta = batch.get("node_batch_meta", None)
+    except Exception:
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _is_skip_batch(batch: Optional[dict]) -> bool:
+    return isinstance(batch, dict) and bool(batch.get("__skip_batch__", False))
+
+
+def _is_node_control_batch(batch: Optional[dict]) -> bool:
+    return isinstance(batch, dict) and "__node_control__" in batch
+
+
+def _check_continuous_batch_epoch(
+    *,
+    params: AttributeDict,
+    batch: Optional[dict],
+) -> Tuple[str, Optional[dict]]:
+    meta = _extract_node_batch_meta(batch)
+    if meta is None:
+        return "process", batch
+    expected_epoch = int(params.cur_epoch) - 1
+    batch_epoch = int(meta.get("epoch", expected_epoch))
+    if batch_epoch < expected_epoch:
+        if _is_node_control_batch(batch):
+            return "skip", None
+        raise RuntimeError(
+            f"Received stale node-data batch from epoch={batch_epoch} while logical epoch={expected_epoch}"
+        )
+    if batch_epoch > expected_epoch:
+        return "defer", batch
+    return "process", batch
+
+
+def _should_end_continuous_epoch_from_control(
+    *,
+    params: AttributeDict,
+    batch: Optional[dict],
+) -> bool:
+    if not _is_node_control_batch(batch):
+        return False
+    meta = _extract_node_batch_meta(batch)
+    if meta is None:
+        return False
+    typ = str(meta.get("type", ""))
+    if typ != "epoch_end":
+        return False
+    expected_epoch = int(params.cur_epoch) - 1
+    batch_epoch = int(meta.get("epoch", expected_epoch))
+    if batch_epoch < expected_epoch:
+        return False
+    if batch_epoch > expected_epoch:
+        raise RuntimeError(
+            f"Received future node-data control from epoch={batch_epoch} while logical epoch={expected_epoch}"
+        )
+    return True
 
 
 def get_adjusted_batch_count(params: AttributeDict) -> float:
@@ -2000,7 +2097,10 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-) -> bool:
+    train_iter: Optional[Iterator[dict]] = None,
+    continuous_node_data_stream: bool = False,
+    pending_batch: Optional[dict] = None,
+) -> Tuple[bool, Iterator[dict], Optional[dict]]:
     """Train the model for one epoch.
 
     The training loss from the mean of all frames is saved in
@@ -2204,25 +2304,49 @@ def train_one_epoch(
         )
 
     model_device = next(model.parameters()).device
-    feature_prefetch_batches = max(0, int(getattr(params, "feature_prefetch_batches", 0)))
-    if rank == 0:
-        logging.info(
-            "Feature prefetch: batches=%s (device=%s)",
-            feature_prefetch_batches,
-            model_device,
+    if train_iter is None:
+        train_iter = _create_train_iter(
+            params=params,
+            model=model,
+            train_dl=train_dl,
+            rank=rank,
         )
-    train_iter = _iter_with_feature_prefetch(
-        train_dl,
-        device=model_device,
-        num_prefetch_batches=feature_prefetch_batches,
-    )
 
-    for batch_idx, batch in enumerate(train_iter):
+    next_pending_batch = pending_batch
+    batch_idx = -1
+    while True:
+        if next_pending_batch is not None:
+            batch = next_pending_batch
+            next_pending_batch = None
+        else:
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                break
+
+        if continuous_node_data_stream:
+            epoch_action, routed_batch = _check_continuous_batch_epoch(
+                params=params,
+                batch=batch,
+            )
+            if epoch_action == "skip":
+                continue
+            if epoch_action == "defer":
+                next_pending_batch = routed_batch
+                break
+            batch = routed_batch
+            if _should_end_continuous_epoch_from_control(
+                params=params,
+                batch=batch,
+            ):
+                break
+
+        batch_idx += 1
         iter_start = time.perf_counter()
         data_time = iter_start - prev_step_end
         compute_start = iter_start
 
-        local_batch_valid = 0 if batch is None else 1
+        local_batch_valid = 0 if (batch is None or _is_skip_batch(batch)) else 1
         global_batch_valid = local_batch_valid
         if world_size > 1 and dist.is_initialized():
             backend = dist.get_backend()
@@ -2383,7 +2507,7 @@ def train_one_epoch(
 
         if params.print_diagnostics and batch_idx == 5:
             _stop_profiler("print_diagnostics early-exit")
-            return False
+            return False, train_iter, next_pending_batch
 
         if (
             rank == 0
@@ -2961,6 +3085,21 @@ def train_one_epoch(
             break
         prev_step_end = time.perf_counter()
 
+    if continuous_node_data_stream and batch_idx < 0 and rank == 0:
+        if next_pending_batch is not None:
+            pending_meta = _extract_node_batch_meta(next_pending_batch) or {}
+            logging.info(
+                "Logical epoch %s completed with zero train batches; carrying pending batch from producer epoch=%s step_id=%s into the next epoch.",
+                int(params.cur_epoch),
+                pending_meta.get("epoch", "<unknown>"),
+                pending_meta.get("step_id", "<unknown>"),
+            )
+        else:
+            logging.info(
+                "Logical epoch %s completed with zero train batches via explicit epoch_end control.",
+                int(params.cur_epoch),
+            )
+
     if prof is not None:
         _stop_profiler("epoch_end")
 
@@ -2994,7 +3133,11 @@ def train_one_epoch(
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
-    return params.max_train_steps > 0 and params.batch_idx_train >= params.max_train_steps
+    return (
+        params.max_train_steps > 0 and params.batch_idx_train >= params.max_train_steps,
+        train_iter,
+        next_pending_batch,
+    )
 
 
 def run(
@@ -3256,10 +3399,34 @@ def run(
             )
             sampler_state_dict = None
 
+    continuous_node_data_stream = bool(
+        node_data_enabled
+        and getattr(params, "node_data_producer_continuous_stream", True)
+    )
     if node_data_enabled:
         metrics_out = str(getattr(params, "node_data_producer_metrics_out", "")).strip()
         if metrics_out == "":
             metrics_out = str(Path(params.exp_dir) / "node_producer_metrics.jsonl")
+        epoch_end_padding_batches = 0
+        if continuous_node_data_stream:
+            queue_size = max(
+                0, int(getattr(params, "node_data_producer_queue_size", 32))
+            )
+            train_prefetch_window = max(
+                1,
+                int(getattr(params, "num_workers", 0))
+                * max(1, int(getattr(params, "prefetch_factor", 2))),
+            )
+            feature_prefetch = max(
+                1, int(getattr(params, "feature_prefetch_batches", 0))
+            )
+            epoch_end_padding_batches = (
+                train_prefetch_window + feature_prefetch + 2
+            )
+            if queue_size > 0:
+                epoch_end_padding_batches = min(
+                    queue_size, epoch_end_padding_batches
+                )
 
         if rank == 0:
             producer_sampler = msr.build_node_producer_sampler(
@@ -3279,13 +3446,15 @@ def run(
                 prefetch_next_epoch=bool(
                     getattr(params, "node_data_producer_prefetch_next_epoch", True)
                 ),
+                epoch_end_padding_batches=int(epoch_end_padding_batches),
             )
             node_producer.start()
             logging.info(
-                "Node data producer started: metrics_out=%s queue_size=%s prefetch_next_epoch=%s",
+                "Node data producer started: metrics_out=%s queue_size=%s prefetch_next_epoch=%s epoch_end_padding_batches=%s",
                 metrics_out,
                 int(getattr(params, "node_data_producer_queue_size", 32)),
                 bool(getattr(params, "node_data_producer_prefetch_next_epoch", True)),
+                int(epoch_end_padding_batches),
             )
 
         train_dl = msr.train_dataloaders(
@@ -3296,6 +3465,10 @@ def run(
     else:
         train_dl = msr.train_dataloaders(
             train_cuts, sampler_state_dict=sampler_state_dict
+        )
+    if continuous_node_data_stream and rank == 0:
+        logging.info(
+            "Node data continuous stream enabled: logical epochs will be handled in train.py without exhausting the consumer iterator."
         )
 
     valid_cuts = msr.dev_cuts()
@@ -3335,11 +3508,14 @@ def run(
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
+    shared_train_iter: Optional[Iterator[dict]] = None
+    shared_pending_batch: Optional[dict] = None
     try:
         for epoch in range(params.start_epoch, params.num_epochs + 1):
             scheduler.step_epoch(epoch - 1)
             fix_random_seed(params.seed + epoch - 1)
-            train_dl.sampler.set_epoch(epoch - 1)
+            if hasattr(train_dl, "sampler") and hasattr(train_dl.sampler, "set_epoch"):
+                train_dl.sampler.set_epoch(epoch - 1)
 
             if node_data_enabled and rank == 0 and node_producer is not None:
                 node_producer.request_epoch(epoch - 1)
@@ -3351,7 +3527,7 @@ def run(
 
             params.cur_epoch = epoch
 
-            reached_max_steps = train_one_epoch(
+            reached_max_steps, next_train_iter, next_pending_batch = train_one_epoch(
                 params=params,
                 model=model,
                 model_avg=model_avg,
@@ -3364,7 +3540,13 @@ def run(
                 tb_writer=tb_writer,
                 world_size=world_size,
                 rank=rank,
+                train_iter=shared_train_iter if continuous_node_data_stream else None,
+                continuous_node_data_stream=continuous_node_data_stream,
+                pending_batch=shared_pending_batch if continuous_node_data_stream else None,
             )
+            if continuous_node_data_stream:
+                shared_train_iter = next_train_iter
+                shared_pending_batch = next_pending_batch
 
             if params.print_diagnostics:
                 diagnostic.print_diagnostics()

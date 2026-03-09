@@ -34,6 +34,7 @@ class ConsumerCutSampler(CutSampler):
         replay_prob: float = 0.25,
         replay_min_interval_steps: int = 100,
         replay_max_ratio: float = 0.03,
+        continuous_stream: bool = True,
     ) -> None:
         super().__init__(
             shuffle=bool(shuffle),
@@ -57,6 +58,7 @@ class ConsumerCutSampler(CutSampler):
         self.replay_prob = min(max(float(replay_prob), 0.0), 1.0)
         self.replay_min_interval_steps = max(1, int(replay_min_interval_steps))
         self.replay_max_ratio = min(max(float(replay_max_ratio), 0.0), 1.0)
+        self.continuous_stream = bool(continuous_stream)
         self._replay_count = 0
         self._last_replay_consumed_step = -10**9
         self._last_yielded_step_id = int(
@@ -288,7 +290,7 @@ class ConsumerCutSampler(CutSampler):
                     )
                 continue
 
-    def __next__(self) -> CutSet:
+    def __next__(self) -> Dict[str, Any]:
         item: Optional[Dict[str, Any]] = None
         while True:
             item = self._poll_next_item()
@@ -297,7 +299,19 @@ class ConsumerCutSampler(CutSampler):
 
             typ = str(item.get("type", ""))
             if typ == "epoch_end":
-                raise StopIteration
+                if not self.continuous_stream:
+                    raise StopIteration
+                return {
+                    "__node_control__": "epoch_end",
+                    "node_batch_meta": {
+                        "epoch": int(item.get("epoch", self.epoch)),
+                        "step_id": int(item.get("step_id", self._last_yielded_step_id)),
+                        "type": "epoch_end",
+                        "replay": False,
+                        "rank": int(self.rank),
+                        "synthetic": bool(item.get("synthetic", False)),
+                    },
+                }
             if typ == "batch":
                 step_id = int(item.get("step_id", -1))
                 if step_id <= int(self._last_yielded_step_id):
@@ -336,4 +350,13 @@ class ConsumerCutSampler(CutSampler):
         attach_dataloading_info(
             selected, rank=int(self.rank), world_size=int(self.world_size)
         )
-        return selected
+        return {
+            "cuts": selected,
+            "node_batch_meta": {
+                "epoch": int(item.get("epoch", self.epoch)),
+                "step_id": int(step_id),
+                "type": str(item.get("type", "")),
+                "replay": str(item.get("type", "")) == "replay_batch",
+                "rank": int(self.rank),
+            },
+        }

@@ -28,6 +28,7 @@ class NodeBatchProducer:
         heartbeat_sec: float = 2.0,
         max_epoch: Optional[int] = None,
         prefetch_next_epoch: bool = True,
+        epoch_end_padding_batches: int = 0,
     ) -> None:
         self.sampler = sampler
         self.ipc = ipc
@@ -36,6 +37,7 @@ class NodeBatchProducer:
         self.heartbeat_sec = max(0.5, float(heartbeat_sec))
         self.max_epoch = None if max_epoch is None else int(max_epoch)
         self.prefetch_next_epoch = bool(prefetch_next_epoch)
+        self.epoch_end_padding_batches = max(0, int(epoch_end_padding_batches))
 
         self._cmd_q: "py_queue.Queue[Optional[int]]" = py_queue.Queue()
         self._thread: Optional[threading.Thread] = None
@@ -254,11 +256,27 @@ class NodeBatchProducer:
             ok = self._put_blocking(r, end_item)
             if not ok:
                 break
+        if self.epoch_end_padding_batches > 0:
+            padding_item = {
+                "type": "epoch_end",
+                "epoch": int(epoch),
+                "step_id": int(self._step_id),
+                "padding": True,
+            }
+            for _ in range(int(self.epoch_end_padding_batches)):
+                for r in range(int(self.ipc.world_size)):
+                    ok = self._put_blocking(r, padding_item)
+                    if not ok:
+                        break
+                if not ok:
+                    break
         # Epoch completion handshake for consumers: even if a control message is
         # lost, consumers can exit once they have consumed up to done_step_id.
         self.ipc.metrics["epoch_done"] = int(epoch)
         self.ipc.metrics["epoch_done_step_id"] = int(self._step_id)
         self.ipc.metrics["epoch_done_ts"] = float(time.time())
+        self.ipc.metrics[f"epoch_done_step_id_epoch{int(epoch)}"] = int(self._step_id)
+        self.ipc.metrics[f"epoch_done_ts_epoch{int(epoch)}"] = float(time.time())
         self.ipc.metrics["produced_epoch"] = int(epoch)
         self._append_metrics(self._collect_metrics(event="epoch_end", epoch=epoch))
 
